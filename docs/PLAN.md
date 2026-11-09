@@ -2,11 +2,13 @@
 
 **Status:** plan, agreed in principle 2026-11-08; open points settled
 2026-11-09 (section 11). Built and tested offline, nothing deployed: G0, G1,
-the gateway half of G2 (`/pricing/v1/health` open) and the Worker half of G4
-(Access service-token headers), each on its own `feature/g<n>-…` branch.
-Waiting on the owner: G2's pricing half (repoint `tcgcsv-freshness.yml`) only
-after the gateway is deployed, or the alert fails; G4's Zero Trust setup.
-Next gate: owner confirms the Cloudflare token's Workers permissions.
+the gateway half of G2 (`/pricing/v1/health` open), the Worker half of G4
+(Access service-token headers) and the Worker half of G5 (sessions, edge cache,
+per-item quote cache), each on its own `feature/g<n>-…` branch, all merged
+into `dev`. The Cloudflare token `tcg-api-gateway` has its permissions and is
+in Bitwarden (`api-gateway`); deploys need the `owner-ops` machine token on the
+PC. Still outside code: G2's alert repoint (after deploy), G4's Zero Trust
+setup, G5's Turnstile widget and the two G5 secrets.
 **Owner repo:** `_services/tcg_api_gateway` (this repo).
 **Replaces:** `_apps/sourcery/gateway` (the Sourcery-only Worker at `api.dyzzyscards.com`).
 
@@ -377,4 +379,27 @@ sections above):
 7. Public session tokens are not IP-bound (section 6.3).
 8. Housekeeping: this repo gets `CLAUDE.md` and `INTEGRATION.md`, and is
    listed in `_services/CLAUDE.md`. Git: a branch per step, committed at the
-   end of each step, never merged to `main`.
+   end of each step, never merged to `main`; step branches merge into `dev`.
+
+**2026-11-09, implementation choices made while building** (owner may revise):
+
+9. `x-fill-policy` goes on every pricing request, not only quotes (pricing
+   treats an absent header as `default`).
+10. CORS/session origins: a bare scheme entry (`chrome-extension://`) matches
+    by prefix; a full origin matches **exactly**, so `https://poke-guide.com`
+    never admits `https://poke-guide.com.evil.example`.
+11. poke-guide's preview origin is `https://dyzfunkshin.github.io` (its
+    preview build is GitHub Pages of `poke-guide-preview`). That origin is
+    shared by every GitHub Pages site of that account; acceptable for a
+    read-only, budget-free session.
+12. Public sessions: per-IP limit via its own binding `RATE_LIMIT_SESSION`
+    (300/min; a page loads many artifacts and images), anonymous callers via
+    `RATE_LIMIT_PUBLIC` (60/min). A session token is bound to its origin and
+    expires in `SESSION_TTL_SECONDS` (1800). Sending any `Authorization` to
+    `POST /v1/session` is checked like everywhere else (decision 3), so sites
+    must not send the old token there.
+13. Edge cache TTLs: artifacts 1 year, images 1 day, manifest 60 s, all else
+    1 hour. Only `fillPolicy: none` clients may use the shared edge cache
+    (enforced by `assertValidClients`). Quote items are cached only when they
+    carry nothing but `game`, exactly one of `productId`/`skuId`, `condition`,
+    `printing`; absent selectors are not defaulted in the key.

@@ -8,7 +8,9 @@
 import { getJson, putJson, deleteKey } from './kv.js';
 import * as polar from './polar.js';
 import { matchPath } from './routes.js';
-import { DEFAULT_CLIENTS, isOpenRoute } from './clients.js';
+import { DEFAULT_CLIENTS, isOpenRoute, originMatches } from './clients.js';
+import { issueSessionToken, readSessionToken, verifyTurnstile } from './session.js';
+import { cacheUrlForGet, cacheUrlForQuoteItem, cacheGet, cachePut, headersOf } from './edge-cache.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const INACTIVE_STATUSES = new Set(['expired', 'revoked', 'disabled']);
@@ -56,20 +58,21 @@ function instanceIdFrom(request) {
   return /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : null;
 }
 
-// Every Origin prefix any client is allowed (CORS is decided before the caller is known:
-// a preflight carries no credential).
-export const corsPrefixesOf = (clients) => [...new Set([clients.anonymous, clients.license, ...clients.appKeys].flatMap((c) => c.origins))];
+// Every Origin entry any client is allowed (CORS is decided before the caller is known:
+// a preflight carries no credential). Entries match per clients.originMatches.
+export const corsOriginsOf = (clients) =>
+  [...new Set([clients.anonymous, clients.license, ...clients.appKeys, ...(clients.publicSessions ?? [])].flatMap((c) => c.origins))];
 
 // CORS headers for an allowed Origin; {} for a missing or disallowed one.
-export function corsHeaders(origin, prefixes) {
+export function corsHeaders(origin, allowedOrigins) {
   if (!origin) return {};
-  if (!prefixes.some((prefix) => origin.startsWith(prefix))) return {};
+  if (!allowedOrigins.some((entry) => originMatches(origin, entry))) return {};
   return {
     'Access-Control-Allow-Origin': origin,
     Vary: 'Origin',
     'Access-Control-Allow-Headers': 'authorization, content-type, x-instance-id',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Expose-Headers': 'X-Quota-Remaining, Retry-After, ETag',
+    'Access-Control-Expose-Headers': 'X-Quota-Remaining, Retry-After, ETag, X-Gateway-Cache',
   };
 }
 
@@ -550,16 +553,16 @@ async function serviceRoute(request, url, route, upstreamPath, caller, env, deps
     if (read.tooLarge) return errorResponse(413, 'payload_too_large');
     body = read.text;
   }
+  let quoteItems = null;
   if (route.id === 'pricing:quote') {
-    let parsed = null;
     try {
-      parsed = JSON.parse(body);
+      quoteItems = JSON.parse(body);
     } catch {
-      parsed = null;
+      quoteItems = null;
     }
-    if (!Array.isArray(parsed)) return errorResponse(400, 'invalid_body');
+    if (!Array.isArray(quoteItems)) return errorResponse(400, 'invalid_body');
     const max = caller.client.maxQuoteItems;
-    if (max !== null && parsed.length > max) return errorResponse(413, 'batch_too_large', { max });
+    if (max !== null && quoteItems.length > max) return errorResponse(413, 'batch_too_large', { max });
   }
 
   const access = accessHeaders(env);
@@ -569,10 +572,133 @@ async function serviceRoute(request, url, route, upstreamPath, caller, env, deps
   }
   const headers = { ...access, 'x-app-token': config.token };
   if (route.service === 'pricing') headers['x-fill-policy'] = fillPolicyOf(caller, env);
-  const response = await forward(request, config.origin + upstreamPath + url.search, headers, body, deps);
+  const target = config.origin + upstreamPath + url.search;
+
+  // 5. Edge cache, for policies that allow it on this route (PLAN.md 6.3 point 5).
+  const ttlSeconds = caller.client.cache ? caller.client.cache[route.id] : undefined;
+  if (ttlSeconds && quoteItems) return cachedQuote(request, target, headers, quoteItems, ttlSeconds, deps);
+  if (ttlSeconds && request.method === 'GET') return cachedGet(request, target, headers, cacheUrlForGet(route.service, upstreamPath, url.search), ttlSeconds, deps);
+
+  const response = await forward(request, target, headers, body, deps);
   const fallbackCacheControl = DEFAULT_CACHE_CONTROL[route.id];
   if (fallbackCacheControl && response.ok && !response.headers.get('cache-control')) response.headers.set('cache-control', fallbackCacheControl);
   return response;
+}
+
+// A GET answered from the edge cache, or forwarded and (on a 200) stored for ttlSeconds.
+async function cachedGet(request, target, headers, cacheUrl, ttlSeconds, deps) {
+  const hit = await cacheGet(deps.cache, cacheUrl, deps.log);
+  if (hit) {
+    return new Response(hit.body, { status: 200, headers: { ...headersOf(hit), 'cache-control': `public, max-age=${ttlSeconds}`, 'x-gateway-cache': 'hit' } });
+  }
+  const response = await forward(request, target, headers, undefined, deps);
+  if (response.status !== 200) return response;
+  const body = await response.arrayBuffer();
+  const kept = headersOf(response);
+  await cachePut(deps.cache, cacheUrl, body, kept, ttlSeconds, deps.log);
+  return new Response(body, { status: 200, headers: { ...kept, 'cache-control': `public, max-age=${ttlSeconds}`, 'x-gateway-cache': 'miss' } });
+}
+
+// A quote batch split per item: cached items are answered from the edge, only the misses
+// go to pricing (in order), and the answers are merged back into request order. Relies on
+// pricing's contract that `data` has the same order and length as the request.
+async function cachedQuote(request, target, headers, items, ttlSeconds, deps) {
+  const cacheUrls = items.map(cacheUrlForQuoteItem);
+  const answers = await Promise.all(
+    cacheUrls.map(async (cacheUrl) => {
+      if (!cacheUrl) return undefined;
+      const hit = await cacheGet(deps.cache, cacheUrl, deps.log);
+      if (!hit) return undefined;
+      try {
+        return await hit.json();
+      } catch {
+        return undefined;
+      }
+    }),
+  );
+  const missIndexes = answers.flatMap((answer, index) => (answer === undefined ? [index] : []));
+  const respond = (state) => jsonResponse(200, { data: answers }, { 'cache-control': 'no-store', 'x-gateway-cache': state });
+  if (missIndexes.length === 0) return respond(items.length === 0 ? 'miss' : 'hit');
+
+  const upstream = await forward(request, target, headers, JSON.stringify(missIndexes.map((index) => items[index])), deps);
+  if (upstream.status !== 200) return upstream;
+  let data = null;
+  try {
+    data = (await upstream.json()).data;
+  } catch {
+    data = null;
+  }
+  if (!Array.isArray(data) || data.length !== missIndexes.length) {
+    deps.log('quote_shape_mismatch', { sent: missIndexes.length, got: Array.isArray(data) ? data.length : null });
+    return errorResponse(502, 'origin_unavailable');
+  }
+  await Promise.all(
+    missIndexes.map((index, position) => {
+      answers[index] = data[position];
+      const cacheUrl = cacheUrls[index];
+      return cacheUrl ? cachePut(deps.cache, cacheUrl, JSON.stringify(data[position]), { 'content-type': 'application/json' }, ttlSeconds, deps.log) : null;
+    }),
+  );
+  return respond(missIndexes.length === items.length ? 'miss' : 'partial');
+}
+
+// ---------- public sessions ----------
+
+const DEFAULT_SESSION_TTL_SECONDS = 1800;
+
+// POST /v1/session: exchanges a Turnstile widget token for a session token (PLAN.md 6.3).
+// The Origin must be exactly one of a public client's origins, and Turnstile must report
+// that origin's hostname.
+async function sessionRoute(request, env, deps) {
+  const origin = request.headers.get('origin') || '';
+  const client = (deps.clients.publicSessions ?? []).find((c) => c.origins.includes(origin));
+  if (!client) return errorResponse(403, 'origin_not_allowed');
+  if (!env.TURNSTILE_SECRET_KEY || !env.SESSION_SIGNING_KEY) {
+    deps.log('session_not_configured', { missing: [!env.TURNSTILE_SECRET_KEY && 'TURNSTILE_SECRET_KEY', !env.SESSION_SIGNING_KEY && 'SESSION_SIGNING_KEY'].filter(Boolean) });
+    return errorResponse(503, 'session_not_configured');
+  }
+  const read = await readBodyText(request);
+  if (read.tooLarge) return errorResponse(413, 'payload_too_large');
+  let widgetToken = null;
+  try {
+    widgetToken = JSON.parse(read.text).turnstileToken;
+  } catch {
+    widgetToken = null;
+  }
+  if (typeof widgetToken !== 'string' || widgetToken.length < 1 || widgetToken.length > 2048) return errorResponse(400, 'invalid_body');
+
+  const verdict = await verifyTurnstile(widgetToken, request.headers.get('cf-connecting-ip'), env.TURNSTILE_SECRET_KEY, deps.fetch);
+  if (verdict.unavailable) return errorResponse(503, 'turnstile_unavailable', {}, { 'Retry-After': '5' });
+  if (!verdict.ok) {
+    deps.log('session_refused', { client: client.id, reason: 'turnstile', errorCodes: verdict.errorCodes });
+    return errorResponse(403, 'turnstile_failed');
+  }
+  if (verdict.hostname !== new URL(origin).hostname) {
+    deps.log('session_refused', { client: client.id, reason: 'hostname', hostname: verdict.hostname });
+    return errorResponse(403, 'turnstile_failed');
+  }
+  const ttlSeconds = toInt(env.SESSION_TTL_SECONDS, DEFAULT_SESSION_TTL_SECONDS) || DEFAULT_SESSION_TTL_SECONDS;
+  const expiresAt = deps.now() + ttlSeconds * 1000;
+  const token = await issueSessionToken({ clientId: client.id, origin, expiresAt }, env.SESSION_SIGNING_KEY);
+  return jsonResponse(200, { token, expiresAt: new Date(expiresAt).toISOString(), ttlSeconds }, { 'cache-control': 'no-store' });
+}
+
+// "Authorization: Session <token>" -> { client, subject } or { response }. The token must
+// be correctly signed, unexpired, name a public client, and be used from its own Origin.
+async function identifySession(token, request, env, deps) {
+  const invalid = (reason) => {
+    deps.log('session_invalid', { reason });
+    return { response: errorResponse(401, 'session_invalid') };
+  };
+  if (!env.SESSION_SIGNING_KEY) return invalid('SESSION_SIGNING_KEY is not configured');
+  const session = await readSessionToken(token, env.SESSION_SIGNING_KEY);
+  if (!session) return invalid('bad signature or format');
+  if (session.expiresAt <= deps.now()) return { response: errorResponse(401, 'session_expired') };
+  const client = (deps.clients.publicSessions ?? []).find((c) => c.id === session.clientId);
+  if (!client) return invalid('unknown client ' + session.clientId);
+  const origin = request.headers.get('origin');
+  if (origin !== session.origin || !client.origins.includes(origin)) return invalid('origin mismatch');
+  return { client, subject: null };
 }
 
 // ---------- callers ----------
@@ -584,6 +710,8 @@ async function identifyCaller(request, env, deps) {
   const { clients } = deps;
   const header = (request.headers.get('authorization') || '').trim();
   if (!header) return { client: clients.anonymous, subject: null };
+  const session = /^Session\s+(\S+)$/i.exec(header);
+  if (session) return identifySession(session[1], request, env, deps);
   if (!/^Bearer\s/i.test(header)) return { response: errorResponse(401, 'credential_invalid') };
   const key = licenseKeyFrom(request);
   if (!key) return { response: errorResponse(401, 'credential_invalid') };
@@ -629,9 +757,10 @@ async function route(request, env, deps) {
     return errorResponse(403, 'forbidden');
   }
 
-  // 4. Quota.
+  // 4. Quota. Anonymous and public-session callers are limited per IP (binding only);
+  // licences and app keys per credential, with a daily KV quota.
   let quota = null;
-  if (client.auth === 'none') {
+  if (client.auth === 'none' || client.auth === 'public-session') {
     const allowed = await bindingAllows(env, client.quota.perMinuteBinding, 'ip:' + callerIp(request), deps);
     if (allowed === false) return minuteExceeded(deps.now(), 60);
   } else {
@@ -639,11 +768,14 @@ async function route(request, env, deps) {
     if (quota.response) return quota.response;
   }
 
-  // 5. (Edge cache: G5.) 6-7. Forward or answer.
+  // 5-7. Answer, or serve from the edge cache / forward (serviceRoute).
   let response;
   switch (route.id) {
     case 'gateway:health':
       response = health(env);
+      break;
+    case 'gateway:session':
+      response = await sessionRoute(request, env, deps);
       break;
     case 'gateway:license.activate':
       response = await activateRoute(request, env, deps);
@@ -661,7 +793,7 @@ async function route(request, env, deps) {
   return response;
 }
 
-// deps: { fetch, now, log, clients } are injectable for tests.
+// deps: { fetch, now, log, clients, cache } are injectable for tests.
 export async function handle(request, env, deps = {}) {
   const resolved = {
     // The runtime fetch must not be called as a method of this object (Workers throws
@@ -670,8 +802,9 @@ export async function handle(request, env, deps = {}) {
     now: deps.now || Date.now,
     log: deps.log || ((event, fields) => console.log(JSON.stringify({ event, ...fields }))),
     clients: deps.clients || DEFAULT_CLIENTS,
+    cache: deps.cache !== undefined ? deps.cache : edgeCache(),
   };
-  const cors = corsHeaders(request.headers.get('origin'), corsPrefixesOf(resolved.clients));
+  const cors = corsHeaders(request.headers.get('origin'), corsOriginsOf(resolved.clients));
 
   let response;
   if (request.method === 'OPTIONS') {

@@ -4,10 +4,9 @@ The gateway (`tcg-api-gateway`, a Cloudflare Worker) is the only way to reach th
 TCG pricing and catalog services from outside the Droplet. You call the gateway;
 it identifies you, checks your policy, and forwards to the service.
 
-> **Status (G1, not yet deployed).** Production `https://api.dyzzyscards.com` is
-> still served by `sourcery-gateway` until cut-over step G3 (see
-> [docs/PLAN.md](docs/PLAN.md) section 8). Public browser sessions
-> (`POST /v1/session`) arrive at G5.
+> **Status (built through G5, not yet deployed).** Production
+> `https://api.dyzzyscards.com` is still served by `sourcery-gateway` until
+> cut-over step G3 (see [docs/PLAN.md](docs/PLAN.md) section 8).
 
 ## Base URL and path scheme
 
@@ -41,6 +40,7 @@ Request and response bodies are the services' own: **each service's
 | `GET /catalog/v1/tags`, `POST /catalog/v1/tags/<eqKey>` | tags (the POST is a write, granted to no client by default) |
 | `GET /v1/health` | gateway config check, no upstream call: `{ok, origins:{pricing, catalog}}` |
 | `POST /v1/license/activate`, `POST /v1/license/deactivate`, `GET /v1/license` | Sourcery licence lifecycle (Polar) |
+| `POST /v1/session` | public browser session from a Turnstile proof (see below) |
 
 Knowing a route is not permission to call it: **your client's policy lists the
 routes you may call.** `<file>` is one path segment of `[A-Za-z0-9._-]`, not
@@ -54,7 +54,8 @@ Send exactly one credential:
 |---|---|
 | Server-side app | `Authorization: Bearer <app key>` (64 hex chars, issued per app) |
 | Sourcery extension | `Authorization: Bearer <licence key>` + `X-Instance-Id: <activation id>` |
-| Open routes only (`GET /v1/health`, `POST /v1/license/activate`, `GET /pricing/v1/health`) | no `Authorization` header (per-IP rate limited) |
+| Public website (poke-guide) | `Authorization: Session <token>` from `POST /v1/session`, sent from the same `Origin` |
+| Open routes only (`GET /v1/health`, `POST /v1/license/activate`, `POST /v1/session`, `GET /pricing/v1/health`) | no `Authorization` header (per-IP rate limited) |
 
 App keys are matched first (by SHA-256); a key that is not an app key is treated
 as a licence when `X-Instance-Id` is present. **A credential that is present but
@@ -63,6 +64,38 @@ invalid is always refused with 401**; it never falls back to anonymous access.
 To get an app key, add a policy row to `src/clients.js` (routes, fill policy,
 quota) and store the key in Bitwarden (project `api-gateway`,
 `TCG_GATEWAY_APP_KEY_<APP>`); see [docs/PLAN.md](docs/PLAN.md) section 6.4.
+
+## Public browser sessions (poke-guide)
+
+A public site cannot keep a secret, so it proves a Cloudflare Turnstile challenge
+instead and gets a short-lived, read-only session:
+
+1. Embed an invisible Turnstile widget (the **site key** is public; it lives in the
+   site's code). When it yields a widget token, call
+   `POST /v1/session` with body `{"turnstileToken": "<widget token>"}` and
+   **no `Authorization` header**. Its `Origin` must be exactly one of the client's
+   origins (`https://poke-guide.com`, preview `https://dyzfunkshin.github.io`).
+2. Response `200 {token, expiresAt, ttlSeconds}` (30 minutes). Send
+   `Authorization: Session <token>` on every call, from the same origin.
+3. Refresh before `expiresAt` (a fresh widget token, step 1). After expiry calls
+   return `401 session_expired`. **Never send the old token to `/v1/session`**:
+   any credential sent there is checked, and an expired one is refused.
+
+The session is not tied to the visitor's IP. It may read prices (quote, max
+**100 items** per call, always cache-only: `x-fill-policy: none`), price
+history, product facts, games lists, the catalog manifest, artifacts and images.
+It cannot write, look up products in bulk, or spend JustTCG budget.
+
+Public responses are edge-cached (`X-Gateway-Cache: hit | miss | partial`):
+artifacts for a year, images a day, the manifest 60 s, everything else an hour.
+Quote batches are cached item by item, so a repeat card is answered from the edge
+and only new items reach pricing.
+
+Session errors: `403 origin_not_allowed` (Origin not allowed), `403
+turnstile_failed` (challenge not solved, or solved on another site), `503
+turnstile_unavailable` (retry after `Retry-After`), `503 session_not_configured`,
+`401 session_invalid` (bad, foreign or wrong-origin token), `401
+session_expired`.
 
 ## What the gateway adds and removes
 

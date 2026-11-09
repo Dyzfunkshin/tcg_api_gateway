@@ -1,7 +1,7 @@
 // Sourcery gateway tests. Plain node:assert, no dependencies.
 // Run: node gateway/test/run.js   (exits non-zero on any failure)
 import assert from 'node:assert/strict';
-import { handle, licenseKeyFrom, corsHeaders, corsPrefixesOf, quotaKeys, resetQuotaMemory } from '../src/worker.js';
+import { handle, licenseKeyFrom, corsHeaders, corsOriginsOf, quotaKeys, resetQuotaMemory } from '../src/worker.js';
 import { DEFAULT_CLIENTS, LICENSE_CLIENT, ANONYMOUS_CLIENT, assertValidClients } from '../src/clients.js';
 import { matchPath } from '../src/routes.js';
 
@@ -671,7 +671,7 @@ test('CORS: allowed extension origin gets headers on normal and error responses'
   eq(res.headers.get('vary'), 'Origin');
   eq(res.headers.get('access-control-allow-headers'), 'authorization, content-type, x-instance-id');
   eq(res.headers.get('access-control-allow-methods'), 'GET, POST, OPTIONS');
-  eq(res.headers.get('access-control-expose-headers'), 'X-Quota-Remaining, Retry-After, ETag');
+  eq(res.headers.get('access-control-expose-headers'), 'X-Quota-Remaining, Retry-After, ETag, X-Gateway-Cache');
   res = await w.send('/v1/license', { key: null, origin: 'moz-extension://xyz' });
   eq(res.status, 401);
   eq(res.headers.get('access-control-allow-origin'), 'moz-extension://xyz');
@@ -686,7 +686,7 @@ test('CORS: disallowed origin gets no CORS headers but is still processed', asyn
   eq(res.status, 200);
   eq(res.headers.get('access-control-allow-origin'), null);
   eq(res.headers.get('access-control-allow-methods'), null);
-  const prefixes = corsPrefixesOf(DEFAULT_CLIENTS);
+  const prefixes = corsOriginsOf(DEFAULT_CLIENTS);
   eq(corsHeaders('https://evil.example', prefixes), {});
   eq(corsHeaders(null, prefixes), {});
   eq(corsHeaders(EXT_ORIGIN, prefixes)['Access-Control-Allow-Origin'], EXT_ORIGIN);
@@ -1286,6 +1286,279 @@ test('access: only one of the two secrets set is a 503, logged, with no upstream
     ok(w.logs.some(([event]) => event === 'access_misconfigured'));
     ok(!JSON.stringify(w.logs).includes('secret-only'), 'the secret is never logged');
   }
+});
+
+// ---------- G5: public sessions, edge cache, per-item quote cache ----------
+
+const SITE = 'https://poke-guide.com';
+const PREVIEW = 'https://dyzfunkshin.github.io';
+const SESSION_ENV = { TURNSTILE_SECRET_KEY: 'turnstile-secret', SESSION_SIGNING_KEY: 'signing-key-0123456789abcdef', RATE_LIMIT_PUBLIC: undefined };
+
+// A Cache API stand-in that honours max-age against the world clock.
+function createFakeCache(clock) {
+  const store = new Map();
+  return {
+    store,
+    async match(url) {
+      const entry = store.get(String(url));
+      if (!entry) return undefined;
+      if (entry.expiresAt <= clock.t) {
+        store.delete(String(url));
+        return undefined;
+      }
+      return new Response(entry.body.slice(0), { status: 200, headers: entry.headers });
+    },
+    async put(url, response) {
+      const maxAge = Number(/max-age=(\d+)/.exec(response.headers.get('cache-control') || '')?.[1] ?? 0);
+      store.set(String(url), { body: await response.arrayBuffer(), headers: Object.fromEntries(response.headers), expiresAt: clock.t + maxAge * 1000 });
+    },
+  };
+}
+
+// A world with the poke-guide client, a fake edge cache, Turnstile, and a pricing origin
+// that answers a quote item by item (so merges can be checked).
+function createPublicWorld(envOverrides = {}) {
+  const w = createWorld({ ...SESSION_ENV, ...envOverrides });
+  w.cache = createFakeCache(w.clock);
+  w.deps.cache = w.cache;
+  w.turnstile = { success: true, hostname: 'poke-guide.com' };
+  w.siteverifyCalls = [];
+  const innerFetch = w.deps.fetch;
+  w.deps.fetch = async (url, init = {}) => {
+    if (String(url) === 'https://challenges.cloudflare.com/turnstile/v0/siteverify') {
+      w.siteverifyCalls.push(Object.fromEntries(new URLSearchParams(String(init.body))));
+      if (w.turnstile === 'down') return new Response('nope', { status: 500 });
+      return jsonResponse({ success: w.turnstile.success, hostname: w.turnstile.hostname, 'error-codes': w.turnstile.success ? [] : ['invalid-input-response'] });
+    }
+    return innerFetch(url, init);
+  };
+  w.responders.pricing = (call) => {
+    if (call.url.includes('/v1/prices/quote')) {
+      const items = JSON.parse(call.body);
+      return jsonResponse({ data: items.map((item) => ({ productId: item.productId ?? null, skuId: item.skuId ?? null, market: 1.5, condition: item.condition ?? null })) });
+    }
+    return jsonResponse({ data: [{ ok: 1 }] }, 200, { etag: '"p1"' });
+  };
+  w.issue = async (origin = SITE, ip = '1.1.1.1') => {
+    const res = await w.send('/v1/session', { method: 'POST', key: null, instance: null, origin, body: { turnstileToken: 'widget-token' }, headers: { 'cf-connecting-ip': ip } });
+    return res.status === 200 ? (await readJson(res)).token : res;
+  };
+  w.publicSend = (path, token, { origin = SITE, ip = '1.1.1.1', ...options } = {}) =>
+    w.send(path, { key: null, instance: null, origin, ...options, headers: { authorization: 'Session ' + token, 'cf-connecting-ip': ip, ...(options.headers || {}) } });
+  w.originCalls = (origin) => w.calls.filter((c) => c.url.startsWith(origin));
+  return w;
+}
+
+test('session: a Turnstile proof from an allowed origin buys a signed 30-minute token', async () => {
+  const w = createPublicWorld();
+  const res = await w.send('/v1/session', { method: 'POST', key: null, instance: null, origin: SITE, body: { turnstileToken: 'widget-token' }, headers: { 'cf-connecting-ip': '1.1.1.1' } });
+  eq(res.status, 200);
+  const body = await readJson(res);
+  eq([body.ttlSeconds, body.expiresAt], [1800, new Date(T0 + 1800 * 1000).toISOString()]);
+  ok(/^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(body.token));
+  eq(res.headers.get('cache-control'), 'no-store');
+  eq(res.headers.get('access-control-allow-origin'), SITE);
+  eq(w.siteverifyCalls, [{ secret: 'turnstile-secret', response: 'widget-token', remoteip: '1.1.1.1' }]);
+});
+
+test('session: the preview origin works when Turnstile reports its hostname', async () => {
+  const w = createPublicWorld();
+  w.turnstile = { success: true, hostname: 'dyzfunkshin.github.io' };
+  ok(typeof (await w.issue(PREVIEW)) === 'string');
+});
+
+test('session: refused for a foreign or look-alike origin before Turnstile is asked', async () => {
+  const w = createPublicWorld();
+  for (const origin of ['https://evil.example', 'https://poke-guide.com.evil.example', 'http://poke-guide.com', null]) {
+    const res = await w.send('/v1/session', { method: 'POST', key: null, instance: null, origin, body: { turnstileToken: 't' } });
+    eq([res.status, await readJson(res)], [403, { error: 'origin_not_allowed' }], String(origin));
+  }
+  eq(w.siteverifyCalls.length, 0);
+});
+
+test('session: failed Turnstile, wrong hostname, Turnstile down, bad body, missing secrets', async () => {
+  let w = createPublicWorld();
+  w.turnstile = { success: false, hostname: 'poke-guide.com' };
+  let res = await w.issue();
+  eq([res.status, await readJson(res)], [403, { error: 'turnstile_failed' }]);
+  w.turnstile = { success: true, hostname: 'evil.example' };
+  res = await w.issue();
+  eq([res.status, await readJson(res)], [403, { error: 'turnstile_failed' }], 'a widget solved on another site does not count');
+  w.turnstile = 'down';
+  res = await w.issue();
+  eq([res.status, res.headers.get('retry-after')], [503, '5']);
+  res = await w.send('/v1/session', { method: 'POST', key: null, instance: null, origin: SITE, body: { nope: 1 } });
+  eq(res.status, 400);
+  for (const missing of ['TURNSTILE_SECRET_KEY', 'SESSION_SIGNING_KEY']) {
+    w = createPublicWorld({ [missing]: '' });
+    res = await w.issue();
+    eq([res.status, await readJson(res)], [503, { error: 'session_not_configured' }], missing);
+    ok(!JSON.stringify(w.logs).includes('turnstile-secret') && !JSON.stringify(w.logs).includes('signing-key-0123'));
+  }
+});
+
+test('session token: works from another IP (not IP-bound), only from its own origin, until it expires', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue(SITE, '1.1.1.1');
+  eq((await w.publicSend('/catalog/v1/manifest.json', token, { ip: '2.2.2.2' })).status, 200, 'a phone that changes IP keeps its session');
+  let res = await w.publicSend('/catalog/v1/manifest.json', token, { origin: PREVIEW });
+  eq([res.status, await readJson(res)], [401, { error: 'session_invalid' }], 'a token is bound to the origin it was issued for');
+  res = await w.publicSend('/catalog/v1/manifest.json', token, { origin: null });
+  eq(res.status, 401);
+  w.clock.t += 1800 * 1000;
+  res = await w.publicSend('/catalog/v1/manifest.json', token);
+  eq([res.status, await readJson(res)], [401, { error: 'session_expired' }]);
+});
+
+test('session token: tampered, foreign-key and malformed tokens are 401 session_invalid', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue();
+  const [version, payload, signature] = token.split('.');
+  const forgedPayload = Buffer.from(JSON.stringify({ c: 'poke-guide', o: SITE, e: T0 + 10 ** 12 })).toString('base64url');
+  const other = createPublicWorld({ SESSION_SIGNING_KEY: 'a-different-signing-key-000000' });
+  const foreignToken = await other.issue();
+  for (const bad of [`${version}.${forgedPayload}.${signature}`, `${version}.${payload}.${signature.slice(0, -2)}AA`, foreignToken, 'v1.x', 'v2.' + payload + '.' + signature, 'garbage']) {
+    const res = await w.publicSend('/catalog/v1/manifest.json', bad);
+    eq([res.status, await readJson(res)], [401, { error: 'session_invalid' }], bad.slice(0, 20));
+  }
+  eq(w.originCalls(CATALOG).length, 0);
+});
+
+test('public policy: reads only, quote forced to fill none and capped at 100, no writes or lookups', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue();
+  for (const [path, method] of [['/catalog/v1/products:lookup', 'POST'], ['/catalog/v1/tags/mew%7C25', 'POST'], ['/catalog/v1/tags', 'GET'], ['/v1/license', 'GET']]) {
+    const res = await w.publicSend(path, token, { method, body: method === 'POST' ? {} : undefined });
+    eq([res.status, await readJson(res)], [403, { error: 'forbidden' }], path);
+  }
+  let res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: [{ productId: 1 }], headers: { 'x-fill-policy': 'default' } });
+  eq(res.status, 200);
+  eq(w.originCalls(PRICING).at(-1).headers['x-fill-policy'], 'none');
+  res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: Array.from({ length: 101 }, (_, i) => ({ productId: i + 1 })) });
+  eq([res.status, await readJson(res)], [413, { error: 'batch_too_large', max: 100 }]);
+});
+
+test('public calls are per-IP limited by the session binding, keyed by IP not token', async () => {
+  const limiter = fakeRateLimiter(2);
+  const w = createPublicWorld({ RATE_LIMIT_SESSION: limiter });
+  const token = await w.issue();
+  eq((await w.publicSend('/pricing/v1/games', token, { ip: '3.3.3.3' })).status, 200);
+  eq((await w.publicSend('/pricing/v1/games', token, { ip: '3.3.3.3' })).status, 200);
+  eq((await w.publicSend('/pricing/v1/games', token, { ip: '3.3.3.3' })).status, 429);
+  eq((await w.publicSend('/pricing/v1/games', token, { ip: '4.4.4.4' })).status, 200);
+  eq(limiter.keys, ['ip:3.3.3.3', 'ip:3.3.3.3', 'ip:3.3.3.3', 'ip:4.4.4.4']);
+});
+
+test('edge cache: repeated public GETs reach the origin once, until the TTL runs out', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue();
+  const path = '/catalog/v1/artifacts/pokemon.0123abcd.json';
+  for (let i = 0; i < 50; i += 1) {
+    const res = await w.publicSend(path, token, { ip: `10.0.0.${i}` });
+    eq(res.status, 200);
+    eq(res.headers.get('x-gateway-cache'), i === 0 ? 'miss' : 'hit');
+    eq(res.headers.get('etag'), '"cat"');
+    eq(res.headers.get('cache-control'), 'public, max-age=31536000');
+  }
+  eq(w.originCalls(CATALOG).length, 1, '50 requests, one origin call');
+  await w.publicSend('/catalog/v1/manifest.json', token);
+  w.clock.t += 61 * 1000;
+  const fresh = await w.issue();
+  eq((await w.publicSend('/catalog/v1/manifest.json', fresh)).headers.get('x-gateway-cache'), 'miss', 'the manifest is kept only 60 s');
+  eq((await w.publicSend(path, fresh)).headers.get('x-gateway-cache'), 'hit', 'the artifact is still cached');
+});
+
+test('edge cache: query strings are part of the key; errors are never cached', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue();
+  await w.publicSend('/pricing/v1/history?game=pokemon&productId=1', token);
+  eq((await w.publicSend('/pricing/v1/history?game=pokemon&productId=2', token)).headers.get('x-gateway-cache'), 'miss');
+  w.responders.catalog = () => jsonResponse({ error: 'not_found' }, 404);
+  eq((await w.publicSend('/catalog/v1/products/9', token)).status, 404);
+  w.responders.catalog = () => jsonResponse({ product: 9 });
+  const res = await w.publicSend('/catalog/v1/products/9', token);
+  eq([res.status, res.headers.get('x-gateway-cache')], [200, 'miss'], 'the 404 was not stored');
+});
+
+test('edge cache: licence and anonymous traffic never reads or writes it', async () => {
+  const w = createPublicWorld();
+  await w.send('/catalog/v1/products/1');
+  await w.send('/catalog/v1/products/1');
+  await w.send('/pricing/v1/health', { key: null, instance: null });
+  eq(w.cache.store.size, 0);
+  eq(w.originCalls(CATALOG).length, 2);
+});
+
+test('quote cache: items are cached one by one; only misses reach pricing; order is kept', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue();
+  const quote = (items) => w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: items });
+  const A = { productId: 1, condition: 'Near Mint', printing: 'Holofoil' };
+  const B = { productId: 2 };
+  const C = { skuId: 555 };
+  let res = await quote([A, B]);
+  eq(res.headers.get('x-gateway-cache'), 'miss');
+  res = await quote([B, C, { ...A, condition: 'near mint' }]);
+  eq(res.headers.get('x-gateway-cache'), 'partial');
+  eq((await readJson(res)).data.map((q) => [q.productId, q.skuId]), [[2, null], [null, 555], [1, null]]);
+  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), [C], 'only the miss was forwarded (condition matched case-insensitively)');
+  res = await quote([C, A, B]);
+  eq(res.headers.get('x-gateway-cache'), 'hit');
+  eq(w.originCalls(PRICING).length, 2, 'an all-hit batch never reaches pricing');
+  w.clock.t += 3601 * 1000;
+  const fresh = await w.issue();
+  res = await w.publicSend('/pricing/v1/prices/quote', fresh, { method: 'POST', body: [A] });
+  eq(res.headers.get('x-gateway-cache'), 'miss', 'items expire after an hour');
+});
+
+test('quote cache: unusual items always go to pricing; a short or failed answer is not merged', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue();
+  const odd = [{ productId: 1, extra: true }, { productId: 1, skuId: 2 }, { condition: 'Near Mint' }, { productId: '1' }];
+  await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: odd });
+  await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: odd });
+  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), odd, 'uncacheable items are forwarded every time');
+  eq(w.cache.store.size, 0);
+  w.responders.pricing = () => jsonResponse({ data: [] });
+  let res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: [{ productId: 7 }] });
+  eq(res.status, 502);
+  ok(w.logs.some(([event]) => event === 'quote_shape_mismatch'));
+  w.responders.pricing = () => jsonResponse({ error: 'bad' }, 400);
+  res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: [{ productId: 7 }] });
+  eq(res.status, 400, 'a pricing 4xx passes through');
+  eq(w.cache.store.size, 0);
+});
+
+test('CORS: site origins match exactly, extension schemes by prefix', async () => {
+  const origins = corsOriginsOf(DEFAULT_CLIENTS);
+  eq(corsHeaders(SITE, origins)['Access-Control-Allow-Origin'], SITE);
+  eq(corsHeaders(PREVIEW, origins)['Access-Control-Allow-Origin'], PREVIEW);
+  eq(corsHeaders('https://poke-guide.com.evil.example', origins), {});
+  eq(corsHeaders('https://poke-guide.com:8443', origins), {});
+  eq(corsHeaders('chrome-extension://anything', origins)['Access-Control-Allow-Origin'], 'chrome-extension://anything');
+});
+
+test('policy table: public and cached rows must be budget-free, read-only, exact-origin', async () => {
+  const base = DEFAULT_CLIENTS.publicSessions[0];
+  const bad = [
+    { ...base, fillPolicy: 'default' },
+    { ...base, routes: [...base.routes, 'catalog:tags.write'] },
+    { ...base, maxQuoteItems: null },
+    { ...base, origins: ['https://poke-guide.com/'] },
+    { ...base, origins: ['http://poke-guide.com'] },
+    { ...base, origins: ['chrome-extension://'] },
+    { ...base, cache: { 'catalog:tags': 60 } },
+    { ...base, quota: { daily: null, perMinute: 1, perMinuteBinding: null } },
+  ];
+  for (const row of bad) {
+    let threw = false;
+    try { assertValidClients({ ...DEFAULT_CLIENTS, publicSessions: [row] }); } catch { threw = true; }
+    ok(threw, JSON.stringify(row).slice(0, 80));
+  }
+  let threw = false;
+  const cachingApp = { id: 'x', auth: 'app-key', keySha256: '0'.repeat(64), routes: ['pricing:games'], fillPolicy: 'default', quota: {}, origins: [], cache: { 'pricing:games': 60 } };
+  try { assertValidClients({ ...DEFAULT_CLIENTS, appKeys: [cachingApp] }); } catch { threw = true; }
+  ok(threw, 'a client that may spend budget may not share the edge cache');
 });
 
 // ---------- runner ----------

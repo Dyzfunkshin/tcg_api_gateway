@@ -19,6 +19,7 @@ export const GATEWAY_ROUTES = Object.freeze([
   route('gateway:license.activate', 'POST', 'gateway', '/v1/license/activate'),
   route('gateway:license.deactivate', 'POST', 'gateway', '/v1/license/deactivate'),
   route('gateway:license', 'GET', 'gateway', '/v1/license'),
+  route('gateway:session', 'POST', 'gateway', '/v1/session'),
 ]);
 
 // Service routes, matched on the path after "/<service>" (so they start "/v1/").
