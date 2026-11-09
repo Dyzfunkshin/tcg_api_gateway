@@ -1,6 +1,7 @@
 # TCG API gateway — the single front door
 
-**Status:** plan, agreed in principle 2026-11-08; nothing built yet.
+**Status:** plan, agreed in principle 2026-11-08; open points settled
+2026-11-09 (section 11). G0–G1 are being built offline.
 **Owner repo:** `_services/tcg_api_gateway` (this repo).
 **Replaces:** `_apps/sourcery/gateway` (the Sourcery-only Worker at `api.dyzzyscards.com`).
 
@@ -137,7 +138,7 @@ reviewed like code; credentials live in Bitwarden (section 7). A policy says:
 | Client | Today | Kind | Auth | Allowed | Fill policy | Notes |
 |---|---|---|---|---|---|---|
 | **Sourcery extension** | Live, via `sourcery/gateway` | Browser extension, paid | `license`: Polar licence key + `X-Instance-Id`, verdict cached in KV (unchanged) | quote, products lookup/get, both games lists, licence routes | by tier: `basic:none`, `pro:default` (unchanged) | Origins `chrome-extension://`, `moz-extension://`. Quotas per key as today (`DAILY_QUOTA=20000`, `BURST_PER_MINUTE=300`). |
-| **poke-guide website** (poke-guide.com) | Reads static snapshots from R2 (`data.poke-guide.com`) | Public static site | `public-session` (section 6.3) | GET only: `pricing/v1/prices/product/:id`, quote (read-only), `pricing/v1/history*`, `pricing/v1/games`; `catalog/v1/manifest.json`, `catalog/v1/artifacts/*`, `catalog/v1/images/*`, `catalog/v1/products/*`, `catalog/v1/games` | **`none`, forced** | Origins `https://poke-guide.com` (+ preview origin). Per-IP limits. Edge-cached. Migration is the poke_guide huddle. |
+| **poke-guide website** (poke-guide.com) | Reads static snapshots from R2 (`data.poke-guide.com`) | Public static site | `public-session` (section 6.3) | Reads only: `POST pricing/v1/prices/quote` (fill policy forced to `none`, **max 100 items per call**), and GET `pricing/v1/prices/product/:id`, `pricing/v1/history*`, `pricing/v1/games`; `catalog/v1/manifest.json`, `catalog/v1/artifacts/*`, `catalog/v1/images/*`, `catalog/v1/products/*`, `catalog/v1/games` | **`none`, forced** | Origins `https://poke-guide.com` (+ preview origin). Per-IP limits. Edge-cached. Migration is the poke_guide huddle. |
 | **Server-side apps**: poke-scans backend, Binder_v2 backend, ops tools, monitors | All point at `localhost:8430/8440` today | Code that can keep a secret | `app-key`: one key per app, `Authorization: Bearer <key>` | per app, least privilege | per app (`default` only where the app genuinely needs per-condition fills) | Keys stored hashed (SHA-256) in the policy table, plaintext only in Bitwarden. |
 | **Browser apps of our own**: Binder web, poke-scans frontend | localhost today | Public code | `public-session`, own client id and origins | per app | `none` unless proxied through that app's own backend | Anything that must spend JustTCG budget goes through a backend with an app key, never straight from a browser. |
 | **Binder mobile** | localhost today | Native app, public code | **Open question**: Turnstile is web-only. Options: route through Binder_v2 backend (app key), or a per-install token like Sourcery's activation. | — | `none` | Decide before mobile ships against production. |
@@ -154,13 +155,35 @@ appears.
 
 1. Match the route. Unknown path -> 404, wrong method -> 405, before any auth
    work.
-2. Identify the client from its credential (licence, app key, or session
-   token). No credential, or an invalid one, means the `none` client, which
-   may only reach the open routes.
-3. Check the policy allows this route. If not -> 403 `{error:"forbidden"}`
-   (or 401 when no credential was sent).
-4. Enforce quota (KV counters, as `sourcery/gateway` does today, keyed per
-   policy). Over quota -> 429 with `Retry-After`.
+2. Identify the client from its credential. Licences and app keys share one
+   header, `Authorization: Bearer <key>`; public sessions use
+   `Authorization: Session <token>`. Resolution order for `Bearer`:
+   1. Look up `sha256(key)` in the app-key table. An exact match is that app
+      key's client. (A licence can never match an app-key hash, so this never
+      depends on a header Sourcery might drop.)
+   2. Otherwise, if `X-Instance-Id` is present, treat the key as a Sourcery
+      licence (section 6.2).
+   3. Otherwise -> 401.
+
+   **A credential that is present but invalid (bad, expired, revoked,
+   unknown, malformed) is refused immediately; it never falls back to the
+   `none` client.** Only a request with no `Authorization` header at all is
+   the `none` client, which may only reach the open routes. Status codes:
+   401 for any invalid credential; the licence path keeps Sourcery's existing
+   codes, which the extension depends on (`401 license_required` when a
+   bearer key has no instance id, `401 license_invalid`, `402
+   license_inactive` for an expired/revoked/disabled licence, `503
+   license_service_unavailable` when Polar is down and there is no grace
+   verdict).
+3. Check the policy allows this route. If not -> 403 `{error:"forbidden"}`,
+   or `401 {error:"credential_required"}` when no credential was sent.
+4. Enforce quota. **Per-minute and per-IP limits use the Workers
+   rate-limiting binding on every plan** (one binding per distinct limit,
+   since a binding's limit and period are fixed in `wrangler.toml`). **KV
+   holds only the daily licence and app-key quotas**, buffered in memory and
+   flushed in batches as `sourcery/gateway` does today. If the plan turns out
+   to be the free one and the daily counters prove too write-heavy, revisit
+   then. Over quota -> 429 with `Retry-After`.
 5. Serve from the edge cache if the policy allows it and there is a fresh hit.
 6. Forward: strip **every** client header except `content-type` and `accept`
    (as today), then add `CF-Access-Client-Id`, `CF-Access-Client-Secret`,
@@ -193,16 +216,21 @@ access **harmless and bounded**, and makes it costly to abuse:
    Turnstile's `siteverify` API (using `TURNSTILE_SECRET_KEY`), checks the
    `Origin` and the hostname Turnstile reports, and returns a **session
    token**: an HMAC-SHA256 (with `SESSION_SIGNING_KEY`) over
-   `{client, origin, ipPrefix, expiresAt}`, valid for about 30 minutes. The
-   site sends it as `Authorization: Session <token>` and refreshes it before
-   expiry. Scripted abuse then needs a solved Turnstile challenge every 30
-   minutes per IP.
-3. **Per-IP rate limits** on every public call: Workers rate-limiting binding
-   or KV counters keyed by IP, plus one Cloudflare WAF rate-limiting rule as
-   a coarse backstop (the free plan includes one rule).
-4. **Harmless by construction.** Public policies are GET (and read-only
-   quote) only, with `fillPolicy: none` forced, so public traffic can never
-   spend JustTCG budget or write anything.
+   `{client, origin, expiresAt}`, valid for about 30 minutes. The site sends
+   it as `Authorization: Session <token>` and refreshes it before expiry.
+   **The token is deliberately not bound to an IP** (decided 2026-11-09):
+   phones and dual-stack networks change IP mid-visit, and a short-lived,
+   read-only session that can never spend JustTCG gains almost nothing from
+   it. Protection comes from the Origin check, Turnstile at issue time,
+   per-IP rate limits, and the short lifetime.
+3. **Per-IP rate limits** on every public call, via the Workers
+   rate-limiting binding keyed by IP (never KV), plus one Cloudflare WAF
+   rate-limiting rule as a coarse backstop (the free plan includes one rule).
+4. **Harmless by construction.** Public policies are reads only: GETs plus
+   `POST pricing/v1/prices/quote`, with `fillPolicy: none` forced whatever
+   the client sends, and a quote batch capped at **100 items** for public
+   clients (`413 {error:"batch_too_large", max:100}` above that) so one call can't do the work of a
+   scrape. Public traffic can never spend JustTCG budget or write anything.
 5. **Edge caching.** `catalog/v1/artifacts/*` are content-hashed and
    immutable, so cache them for a year. Cache `prices/product/:id`, games and
    history GETs for about 1 hour. Quote is a POST batch, so the Worker splits
@@ -278,7 +306,7 @@ Sourcery verdicts survive the cut-over.
 | G0 | Bootstrap: copy `sourcery/gateway` (src, tests, wrangler) here with a provenance note; deploy as `tcg-api-gateway` on `*.workers.dev` only; same behaviour as today. | gateway | Test suite green; the `workers.dev` URL answers `/v1/health`. |
 | G1 | Namespaced routing `/pricing/v1/*`, `/catalog/v1/*`; client/policy table; legacy aliases mapped. | gateway | Tests cover allow, deny, alias, header stripping, and forced fill policy. |
 | G2 | `GET /pricing/v1/health` open through the gateway; pricing's freshness alert repointed to it. | gateway, pricing | Alert workflow green against the gateway URL. |
-| G3 | Cut `api.dyzzyscards.com` over from `sourcery-gateway` to `tcg-api-gateway`; push secrets. | gateway | Sourcery's deployed e2e passes 8/8 through the new Worker (`F:/claude_temp/poke-scans/sourcery-e2e-deployed.py`). |
+| G3 | Cut `api.dyzzyscards.com` over from `sourcery-gateway` to `tcg-api-gateway`; push secrets. The custom-domain detach (old Worker) and reattach (new Worker) run as **one scripted step**; a gap of seconds to a minute is acceptable (Sourcery is the only live client and retries). **Stop at that step for the owner's go-ahead.** | gateway | Sourcery's deployed e2e passes 8/8 through the new Worker (`F:/claude_temp/poke-scans/sourcery-e2e-deployed.py`). |
 | G4 | Lock origins with Access (section 4). | gateway (+ Cloudflare) | Direct origin curl is denied; e2e still 8/8; freshness alert still green. |
 | G5 | Public sessions: Turnstile, per-IP limits, edge cache, per-item quote cache. | gateway | Tests; a load test shows cached hits never reaching the origin. |
 | G6 | poke-guide switches from R2 snapshots to the gateway (huddle with `_apps/poke_guide`). | poke_guide, gateway | poke-guide.com search and prices work with R2 unused. |
@@ -287,6 +315,15 @@ Sourcery verdicts survive the cut-over.
 
 Do G0–G4 before onboarding any new client: they move today's live traffic
 safely, and the lock (G4) is the security win on its own.
+
+**Build gates (2026-11-09).** G0 and G1 are built and tested **offline
+only**: no `wrangler deploy`, no secret push, no Cloudflare API call of any
+kind until the owner confirms the Cloudflare API token has the Workers
+permissions (section 7). G0's "workers.dev URL answers" check waits for that.
+
+**Git.** One branch per step (`feature/g0-bootstrap`, `feature/g1-…`, …),
+each branched from the previous, committed at the end of the step. Never
+merged to `main` by Claude; there is no remote yet.
 
 ## 9. Testing
 
@@ -306,3 +343,28 @@ safely, and the lock (G4) is the security win on its own.
    Sourcery one (section 7).
 4. Final name: repo `tcg_api_gateway` and Worker `tcg-api-gateway` are working
    names.
+5. Workers plan tier (free vs paid) is unconfirmed. The design does not
+   depend on it (section 6.1 step 4).
+
+## 11. Decisions log
+
+**2026-11-09** (owner answers before building; already folded into the
+sections above):
+
+1. Scope: build G0 and G1 offline with tests passing, then stop. No deploy,
+   secret push or Cloudflare API call until the token's Workers permissions
+   are confirmed (section 8).
+2. Licences and app keys share `Authorization: Bearer`; app-key hash lookup
+   first, then licence if `X-Instance-Id` is present, else 401 (section 6.1).
+3. A present-but-invalid credential is always a 401, never the `none`
+   client (section 6.1). Sourcery's licence error codes are kept.
+4. Public clients may call quote, forced to `fillPolicy: none`, max 100
+   items per call (sections 5, 6.3).
+5. Per-minute and per-IP limits use the rate-limiting binding on any plan;
+   KV only for daily licence/app-key quotas (section 6.1).
+6. G3 cut-over: brief gap acceptable; detach and reattach scripted as one
+   step, stopping for the owner's go-ahead (section 8).
+7. Public session tokens are not IP-bound (section 6.3).
+8. Housekeeping: this repo gets `CLAUDE.md` and `INTEGRATION.md`, and is
+   listed in `_services/CLAUDE.md`. Git: a branch per step, committed at the
+   end of each step, never merged to `main`.
