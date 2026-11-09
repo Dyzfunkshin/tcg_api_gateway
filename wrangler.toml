@@ -1,0 +1,31 @@
+name = "tcg-api-gateway"
+main = "src/worker.js"
+compatibility_date = "2026-10-01"
+# G0-G2: workers.dev only. api.dyzzyscards.com stays on sourcery-gateway until the
+# G3 cut-over (docs/PLAN.md section 8), which re-adds:
+#   routes = [{ pattern = "api.dyzzyscards.com", custom_domain = true }]
+workers_dev = true
+
+# Create with: npx wrangler kv namespace create LICENSES
+# then paste the printed id below. The placeholder id will not deploy.
+[[kv_namespaces]]
+binding = "LICENSES"
+id = "3216419ee1244988a05fc0bad9d7b17c"
+
+# Non-secret configuration. Secrets are NOT listed here; set each with
+#   npx wrangler secret put <NAME>
+# Secrets: PRICING_APP_TOKEN, CATALOG_APP_TOKEN
+[vars]
+POLAR_ORGANIZATION_ID = "3a6001fe-6581-43e2-810d-48c8febbae1d"      # Polar organization id; empty rejects every key
+POLAR_BENEFIT_IDS = ""          # comma list of License Keys benefit ids that grant access; empty = any benefit of the organization
+POLAR_TIERS = "fb9ee746-6350-4713-b418-c76eccfef570:basic,0917b3fb-a187-421a-8b7a-05575df57101:pro"                # comma list of <benefit_id>:<tier>, e.g. "fb9ee746-...:basic,1234abcd-...:pro"; basic = cached NM/product prices, pro = per-condition prices (may spend JustTCG budget); also the allow-list when POLAR_BENEFIT_IDS is empty
+POLAR_API_BASE ="https://sandbox-api.polar.sh" # use https://sandbox-api.polar.sh for testing
+PRICING_ORIGIN = "https://pricing-origin.dyzzyscards.com"             # private pricing origin (tunnel hostname), e.g. https://pricing.example.com
+CATALOG_ORIGIN = "https://catalog-origin.dyzzyscards.com"             # private catalog origin (tunnel hostname)
+FILL_POLICY = "none"            # x-fill-policy on quote requests for a key whose benefit has no tier
+FILL_POLICY_BY_TIER = "basic:none,pro:default" # comma list of <tier>:<policy>; x-fill-policy per tier
+DAILY_QUOTA = "20000"           # requests per key per UTC day; a 500-page seller scan is 500-1500 requests (owner 2026-11-06)
+BURST_PER_MINUTE = "300"        # requests per key per minute; a scan turns a page every 0.5-3 s with 1-3 requests each plus no-price retries
+LICENSE_CACHE_SECONDS = "600"   # how long a validate verdict is cached
+LICENSE_GRACE_SECONDS = "86400" # how long a cached valid verdict is reused when Polar is unreachable
+ALLOWED_ORIGIN_PREFIXES = "chrome-extension://,moz-extension://"

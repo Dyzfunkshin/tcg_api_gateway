@@ -1,0 +1,15 @@
+{
+  "name": "tcg-api-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker: the single front door to the TCG pricing and catalog services. Client policies, licence/app-key auth, quotas, allow-listed forwarding.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node test/run.js",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  }
+}
