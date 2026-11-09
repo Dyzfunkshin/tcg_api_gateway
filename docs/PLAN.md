@@ -256,11 +256,13 @@ touching any other client.
 
 ## 7. Secrets: Bitwarden is the source of truth
 
-Constraints (from the owner): the Bitwarden org is at its limit of **3
-projects** (`poke-scans`, `poke-scans-test`, `tcg-tools`) and **3 machine
-accounts**. No new ones can be created, so the gateway's secrets go into the
-existing **`poke-scans`** project next to the service tokens it forwards.
-Secret values are never printed or committed.
+Layout (owner, 2026-11-09): a new Bitwarden organization
+(`fb861205-eddd-488f-a18c-b4fd0066477a`) with one project and one read-only
+machine account per consumer, so no token reads more than its service needs.
+The gateway's own secrets go in project **`api-gateway`**
+(`a24de797-21ea-4454-b0a9-b4fd0070fc4a`), read by machine account
+`api-gateway`. The service tokens it forwards stay in project `hosted-api`
+(shared with the Droplet stacks). Secret values are never printed or committed.
 
 **How they reach the Worker.** Workers cannot run the Bitwarden SDK at
 request time, and should not. `tools/push_secrets.py` reads each secret from
@@ -270,31 +272,32 @@ only, never values. Run it after creating or rotating a secret. It follows the
 pattern already used for `sourcery-gateway`:
 `F:/claude_temp/tcg_pricing_service/bw_secret_ops.py push-worker`, run inside
 the pricing image's `/opt/publisher/bin/python`, which has `bitwarden_sdk`.
-That script is a throwaway; promote a cleaned-up version into this repo. Use
-the PC's `tcg-tools` machine token
-(`%LOCALAPPDATA%\tcg-pricing-secrets\bitwarden_access_token`), which reads the
-`poke-scans` project.
+That script is a throwaway; promote a cleaned-up version into this repo. Pushes
+run as the owner, so use the `owner-ops` machine token (read/write on every
+project; Windows Credential Manager entry `owner-ops/bitwarden-machine-token`,
+read with `tcg_catalog_service/tools/machine_token.py --target
+owner-ops/bitwarden-machine-token`), never a token mounted into a service.
 
-| Worker secret | Purpose | Bitwarden secret (project `poke-scans`) | Exists? |
+| Worker secret | Purpose | Bitwarden secret (project) | Exists? |
 |---|---|---|---|
-| `PRICING_APP_TOKEN` | `x-app-token` to pricing | `PRICING_APP_TOKEN`, id `98bcb930-145c-441f-b635-b4fc014312f9` | **Yes** (rotated 2026-11-08; already pushed to `sourcery-gateway`) |
-| `CATALOG_APP_TOKEN` | `x-app-token` to catalog | `CATALOG_APP_TOKEN`, id `0aa37fc0-6ced-452d-9621-b4fc01675281` | **Yes** (rotated 2026-11-08; already pushed to `sourcery-gateway`) |
-| `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` | Cloudflare Access service token (section 4) | to create: `TCG_GATEWAY_ACCESS_CLIENT_ID`, `TCG_GATEWAY_ACCESS_CLIENT_SECRET` | **No.** Create the service token in Zero Trust, then store both halves. |
-| `TURNSTILE_SECRET_KEY` | verify Turnstile (section 6.3) | to create: `TCG_GATEWAY_TURNSTILE_SECRET` | **No.** Create a Turnstile widget for poke-guide.com (+ preview host). Its **site key is public** and goes in poke_guide's code, not Bitwarden. |
-| `SESSION_SIGNING_KEY` | HMAC for public session tokens | to create: `TCG_GATEWAY_SESSION_SIGNING_KEY` | **No.** 32 random bytes; generate it inside the push tool so it is never displayed. |
-| App keys (one per server-side app) | `app-key` clients (section 6.4) | to create: `TCG_GATEWAY_APP_KEY_<APP>` | **No.** Create one per app when that app onboards. Only the hash goes in `src/clients.js`. |
+| `PRICING_APP_TOKEN` | `x-app-token` to pricing | `PRICING_APP_TOKEN`, id `6f7c5b06-131c-4e77-9e93-bebcadfc5e9d` (`hosted-api`) | **Yes** (already pushed to `sourcery-gateway`) |
+| `CATALOG_APP_TOKEN` | `x-app-token` to catalog | `CATALOG_APP_TOKEN`, id `cc0ded80-9afc-471a-903c-9a139e17e777` (`hosted-api`) | **Yes** (already pushed to `sourcery-gateway`) |
+| `ACCESS_CLIENT_ID`, `ACCESS_CLIENT_SECRET` | Cloudflare Access service token (section 4) | to create in `api-gateway`: `TCG_GATEWAY_ACCESS_CLIENT_ID`, `TCG_GATEWAY_ACCESS_CLIENT_SECRET` | **No.** Create the service token in Zero Trust, then store both halves. |
+| `TURNSTILE_SECRET_KEY` | verify Turnstile (section 6.3) | to create in `api-gateway`: `TCG_GATEWAY_TURNSTILE_SECRET` | **No.** Create a Turnstile widget for poke-guide.com (+ preview host). Its **site key is public** and goes in poke_guide's code, not Bitwarden. |
+| `SESSION_SIGNING_KEY` | HMAC for public session tokens | to create in `api-gateway`: `TCG_GATEWAY_SESSION_SIGNING_KEY` | **No.** 32 random bytes; generate it inside the push tool so it is never displayed. |
+| App keys (one per server-side app) | `app-key` clients (section 6.4) | to create in `api-gateway`: `TCG_GATEWAY_APP_KEY_<APP>` | **No.** Create one per app when that app onboards. Only the hash goes in `src/clients.js`. |
 
 Deployment credentials (used by `wrangler deploy` / `push_secrets.py`, not by
 the Worker):
 
 | Credential | Bitwarden | Exists? |
 |---|---|---|
-| Cloudflare API token | `sourcery_cloudflare_api_token`, id `31101705-9fb0-4d5e-a0a0-b4fa0064a273` | **Yes, but permissions are incomplete.** It has *Cloudflare Tunnel: Edit* (added 2026-11-08). It also needs *Workers Scripts: Edit*, *Workers KV Storage: Edit*, *Workers Routes: Edit* (zone `dyzzyscards.com`), *Access: Apps and Policies: Edit*, *Access: Service Tokens: Edit*, and *Turnstile: Edit*. Check what it already has before adding, under dash → Manage Account → Account API Tokens. Alternatively create a dedicated `tcg_gateway_cloudflare_api_token` and keep the Sourcery one tunnel-only. |
-| Bitwarden machine token (PC) | n/a (local file above) | **Yes.** Writing *new* secrets needs that machine account set to **Can read, write** on `poke-scans` temporarily; set it back to read afterwards. |
+| Cloudflare API token | `sourcery_cloudflare_api_token`, id `fae6f4f6-ca7b-401d-a71d-090af6411149` (`owner-ops`) | **Yes, but permissions are incomplete.** It has *Cloudflare Tunnel: Edit* (added 2026-11-08). It also needs *Workers Scripts: Edit*, *Workers KV Storage: Edit*, *Workers Routes: Edit* (zone `dyzzyscards.com`), *Access: Apps and Policies: Edit*, *Access: Service Tokens: Edit*, and *Turnstile: Edit*. Check what it already has before adding, under dash → Manage Account → Account API Tokens. Alternatively create a dedicated `tcg_gateway_cloudflare_api_token` and keep the Sourcery one tunnel-only. |
+| Bitwarden machine token (PC) | n/a (`owner-ops`, Credential Manager, above) | **Yes.** `owner-ops` is already **Can read, write** on every project, so creating the `api-gateway` secrets needs no temporary permission change. |
 
 Unchanged and not the gateway's concern: `JUSTTCG_API_KEY`
-(`a5ab198c-…`), used only by pricing; `sourcery_tunnel` (`91eab35c-…`), the
-Droplet's tunnel token.
+(`139c13f6-…`, project `pricing-runtime`), used only by pricing;
+`sourcery_tunnel` (`b7dac9bb-…`, project `hosted-api`), the Droplet's tunnel token.
 
 Non-secret configuration (`wrangler.toml` `[vars]`): `PRICING_ORIGIN`,
 `CATALOG_ORIGIN`, `POLAR_*`, `ALLOWED_ORIGIN_PREFIXES` per client (or folded
