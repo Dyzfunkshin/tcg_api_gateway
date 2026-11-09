@@ -1321,14 +1321,14 @@ function createPublicWorld(envOverrides = {}) {
   const w = createWorld({ ...SESSION_ENV, ...envOverrides });
   w.cache = createFakeCache(w.clock);
   w.deps.cache = w.cache;
-  w.turnstile = { success: true, hostname: 'poke-guide.com' };
+  w.turnstile = { success: true, hostname: 'poke-guide.com', action: 'gateway-session' };
   w.siteverifyCalls = [];
   const innerFetch = w.deps.fetch;
   w.deps.fetch = async (url, init = {}) => {
     if (String(url) === 'https://challenges.cloudflare.com/turnstile/v0/siteverify') {
       w.siteverifyCalls.push(Object.fromEntries(new URLSearchParams(String(init.body))));
       if (w.turnstile === 'down') return new Response('nope', { status: 500 });
-      return jsonResponse({ success: w.turnstile.success, hostname: w.turnstile.hostname, 'error-codes': w.turnstile.success ? [] : ['invalid-input-response'] });
+      return jsonResponse({ success: w.turnstile.success, hostname: w.turnstile.hostname, ...(w.turnstile.action === undefined ? {} : { action: w.turnstile.action }), 'error-codes': w.turnstile.success ? [] : ['invalid-input-response'] });
     }
     return innerFetch(url, init);
   };
@@ -1363,7 +1363,7 @@ test('session: a Turnstile proof from an allowed origin buys a signed 30-minute 
 
 test('session: the preview origin works when Turnstile reports its hostname', async () => {
   const w = createPublicWorld();
-  w.turnstile = { success: true, hostname: 'dyzfunkshin.github.io' };
+  w.turnstile = { success: true, hostname: 'dyzfunkshin.github.io', action: 'gateway-session' };
   ok(typeof (await w.issue(PREVIEW)) === 'string');
 });
 
@@ -1395,6 +1395,33 @@ test('session: failed Turnstile, wrong hostname, Turnstile down, bad body, missi
     eq([res.status, await readJson(res)], [503, { error: 'session_not_configured' }], missing);
     ok(!JSON.stringify(w.logs).includes('turnstile-secret') && !JSON.stringify(w.logs).includes('signing-key-0123'));
   }
+});
+
+test('session: the Turnstile action must match the client (allow, wrong, missing)', async () => {
+  let w = createPublicWorld();
+  let res = await w.issue();
+  eq(typeof res, 'string', 'matching action buys a session token');
+  w = createPublicWorld();
+  w.turnstile = { success: true, hostname: 'poke-guide.com', action: 'some-other-widget' };
+  res = await w.issue();
+  eq([res.status, await readJson(res)], [403, { error: 'turnstile_failed' }], 'wrong action');
+  ok(w.logs.some((l) => JSON.stringify(l).includes('action mismatch')), 'reason logged server-side');
+  w = createPublicWorld();
+  w.turnstile = { success: true, hostname: 'poke-guide.com' };
+  res = await w.issue();
+  eq([res.status, await readJson(res)], [403, { error: 'turnstile_failed' }], 'missing action');
+});
+
+test('policy table: public rows need a valid turnstileAction', async () => {
+  const base = DEFAULT_CLIENTS.publicSessions[0];
+  eq(base.turnstileAction, 'gateway-session');
+  const { turnstileAction, ...without } = base;
+  for (const row of [without, { ...base, turnstileAction: '' }, { ...base, turnstileAction: 'has space' }, { ...base, turnstileAction: 'x'.repeat(33) }, { ...base, turnstileAction: 5 }]) {
+    let threw = false;
+    try { assertValidClients({ ...DEFAULT_CLIENTS, publicSessions: [row] }); } catch { threw = true; }
+    ok(threw, JSON.stringify(row.turnstileAction));
+  }
+  assertValidClients({ ...DEFAULT_CLIENTS, publicSessions: [{ ...base, turnstileAction: 'abc_DEF-123' }] });
 });
 
 test('session token: works from another IP (not IP-bound), only from its own origin, until it expires', async () => {

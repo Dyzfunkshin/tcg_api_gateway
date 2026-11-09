@@ -677,6 +677,11 @@ async function sessionRoute(request, env, deps) {
     deps.log('session_refused', { client: client.id, reason: 'hostname', hostname: verdict.hostname });
     return errorResponse(403, 'turnstile_failed');
   }
+  // a token from a different widget on the same hostname must not buy a session
+  if (verdict.action !== client.turnstileAction) {
+    deps.log('session_refused', { client: client.id, reason: 'action mismatch', action: verdict.action });
+    return errorResponse(403, 'turnstile_failed');
+  }
   const ttlSeconds = toInt(env.SESSION_TTL_SECONDS, DEFAULT_SESSION_TTL_SECONDS) || DEFAULT_SESSION_TTL_SECONDS;
   const expiresAt = deps.now() + ttlSeconds * 1000;
   const token = await issueSessionToken({ clientId: client.id, origin, expiresAt }, env.SESSION_SIGNING_KEY);

@@ -66,7 +66,7 @@ export async function readSessionToken(token, signingSecret) {
   }
 }
 
-// Asks Turnstile whether a widget token is genuine. Resolves { ok, hostname, errorCodes }
+// Asks Turnstile whether a widget token is genuine. Resolves { ok, hostname, action, errorCodes }
 // or { unavailable: true } when siteverify could not answer.
 export async function verifyTurnstile(widgetToken, remoteIp, secret, fetchImpl) {
   const form = new URLSearchParams({ secret, response: widgetToken });
@@ -84,5 +84,5 @@ export async function verifyTurnstile(widgetToken, remoteIp, secret, fetchImpl) 
   } catch {
     return { unavailable: true };
   }
-  return { ok: body.success === true, hostname: typeof body.hostname === 'string' ? body.hostname : null, errorCodes: Array.isArray(body['error-codes']) ? body['error-codes'] : [] };
+  return { ok: body.success === true, hostname: typeof body.hostname === 'string' ? body.hostname : null, action: typeof body.action === 'string' ? body.action : null, errorCodes: Array.isArray(body['error-codes']) ? body['error-codes'] : [] };
 }
