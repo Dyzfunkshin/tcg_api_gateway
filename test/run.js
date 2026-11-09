@@ -1244,6 +1244,50 @@ test('pricing health: anonymous calls are per-IP limited by the public binding',
   eq((await w.send('/pricing/v1/health', { key: null, instance: null, headers })).status, 429);
 });
 
+// ---------- G4: Cloudflare Access service-token headers ----------
+
+const ACCESS_ENV = { ACCESS_CLIENT_ID: 'access-id.access', ACCESS_CLIENT_SECRET: 'access-secret' };
+
+test('access: with both secrets set, every forwarded request carries the service-token headers', async () => {
+  const w = createWorld(ACCESS_ENV);
+  await w.send('/pricing/v1/prices/quote', { method: 'POST', body: [] });
+  await w.send('/catalog/v1/products/1');
+  await w.send('/pricing/v1/health', { key: null, instance: null });
+  const upstream = w.calls.filter((c) => c.url.startsWith(PRICING) || c.url.startsWith(CATALOG));
+  eq(upstream.length, 3);
+  for (const call of upstream) {
+    eq([call.headers['cf-access-client-id'], call.headers['cf-access-client-secret']], ['access-id.access', 'access-secret'], call.url);
+  }
+});
+
+test('access: Polar calls never carry the service token', async () => {
+  const w = createWorld(ACCESS_ENV);
+  await w.send('/v1/license');
+  const polarCall = w.polarCalls('validate')[0];
+  eq([polarCall.headers['cf-access-client-id'], polarCall.headers['cf-access-client-secret']], [undefined, undefined]);
+});
+
+test('access: a client cannot supply or override the service-token headers', async () => {
+  const forged = { 'cf-access-client-id': 'forged', 'cf-access-client-secret': 'forged' };
+  let w = createWorld(ACCESS_ENV);
+  await w.send('/catalog/v1/products/1', { headers: forged });
+  eq(lastUpstream(w, CATALOG).headers['cf-access-client-id'], 'access-id.access');
+  w = createWorld();
+  await w.send('/catalog/v1/products/1', { headers: forged });
+  eq(lastUpstream(w, CATALOG).headers['cf-access-client-id'], undefined, 'before the lock, nothing is sent');
+});
+
+test('access: only one of the two secrets set is a 503, logged, with no upstream call', async () => {
+  for (const env of [{ ACCESS_CLIENT_ID: 'id-only' }, { ACCESS_CLIENT_SECRET: 'secret-only' }]) {
+    const w = createWorld(env);
+    const res = await w.send('/catalog/v1/products/1');
+    eq([res.status, await readJson(res)], [503, { error: 'origin_not_configured' }]);
+    eq(w.calls.filter((c) => c.url.startsWith(CATALOG)).length, 0);
+    ok(w.logs.some(([event]) => event === 'access_misconfigured'));
+    ok(!JSON.stringify(w.logs).includes('secret-only'), 'the secret is never logged');
+  }
+});
+
 // ---------- runner ----------
 
 let failures = 0;

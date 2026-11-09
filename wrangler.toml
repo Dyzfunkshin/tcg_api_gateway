@@ -14,7 +14,8 @@ id = "3216419ee1244988a05fc0bad9d7b17c"
 
 # Non-secret configuration. Secrets are NOT listed here; set each with
 #   npx wrangler secret put <NAME>
-# Secrets: PRICING_APP_TOKEN, CATALOG_APP_TOKEN
+# Secrets: PRICING_APP_TOKEN, CATALOG_APP_TOKEN, and from G4 ACCESS_CLIENT_ID +
+# ACCESS_CLIENT_SECRET (set both or neither; one alone makes every forward a 503)
 [vars]
 POLAR_ORGANIZATION_ID = "3a6001fe-6581-43e2-810d-48c8febbae1d"      # Polar organization id; empty rejects every key
 POLAR_BENEFIT_IDS = ""          # comma list of License Keys benefit ids that grant access; empty = any benefit of the organization

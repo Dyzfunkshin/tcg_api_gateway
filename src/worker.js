@@ -390,6 +390,18 @@ const originConfig = (env, name) => {
   return origin && token ? { origin, token } : null;
 };
 
+// The Cloudflare Access service-token headers every forwarded request carries once the
+// origins are locked (PLAN.md section 4, step G4). Both secrets unset = no headers (before
+// the lock); exactly one set is a misconfiguration and returns null, so the request fails
+// loudly here instead of as an Access denial at the origin.
+function accessHeaders(env) {
+  const id = String(env.ACCESS_CLIENT_ID ?? '');
+  const secret = String(env.ACCESS_CLIENT_SECRET ?? '');
+  if (!id && !secret) return {};
+  if (!id || !secret) return null;
+  return { 'cf-access-client-id': id, 'cf-access-client-secret': secret };
+}
+
 async function readBodyText(request) {
   const declared = Number.parseInt(request.headers.get('content-length') ?? '', 10);
   if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return { tooLarge: true };
@@ -550,7 +562,12 @@ async function serviceRoute(request, url, route, upstreamPath, caller, env, deps
     if (max !== null && parsed.length > max) return errorResponse(413, 'batch_too_large', { max });
   }
 
-  const headers = { 'x-app-token': config.token };
+  const access = accessHeaders(env);
+  if (!access) {
+    deps.log('access_misconfigured', { reason: 'only one of ACCESS_CLIENT_ID / ACCESS_CLIENT_SECRET is set' });
+    return errorResponse(503, 'origin_not_configured');
+  }
+  const headers = { ...access, 'x-app-token': config.token };
   if (route.service === 'pricing') headers['x-fill-policy'] = fillPolicyOf(caller, env);
   const response = await forward(request, config.origin + upstreamPath + url.search, headers, body, deps);
   const fallbackCacheControl = DEFAULT_CACHE_CONTROL[route.id];

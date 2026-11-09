@@ -1,12 +1,12 @@
 # TCG API gateway — the single front door
 
 **Status:** plan, agreed in principle 2026-11-08; open points settled
-2026-11-09 (section 11). G0, G1 and the gateway half of G2 built and tested
-offline (branches `feature/g0-bootstrap`, `feature/g1-namespaced-routing`,
-`feature/g2-pricing-health`); nothing deployed. G2's pricing half (repointing
-`tcgcsv-freshness.yml` at the gateway) must wait until the gateway is deployed
-and answering, or the alert fails. Next gate: owner confirms the Cloudflare
-token's Workers permissions.
+2026-11-09 (section 11). Built and tested offline, nothing deployed: G0, G1,
+the gateway half of G2 (`/pricing/v1/health` open) and the Worker half of G4
+(Access service-token headers), each on its own `feature/g<n>-…` branch.
+Waiting on the owner: G2's pricing half (repoint `tcgcsv-freshness.yml`) only
+after the gateway is deployed, or the alert fails; G4's Zero Trust setup.
+Next gate: owner confirms the Cloudflare token's Workers permissions.
 **Owner repo:** `_services/tcg_api_gateway` (this repo).
 **Replaces:** `_apps/sourcery/gateway` (the Sourcery-only Worker at `api.dyzzyscards.com`).
 
