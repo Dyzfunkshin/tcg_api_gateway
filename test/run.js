@@ -134,7 +134,6 @@ function createWorld(envOverrides = {}) {
     BURST_PER_MINUTE: '60',
     LICENSE_CACHE_SECONDS: '600',
     LICENSE_GRACE_SECONDS: '86400',
-    ALLOWED_ORIGIN_PREFIXES: 'chrome-extension://,moz-extension://',
     ...envOverrides,
   };
   const logs = [];
@@ -691,6 +690,14 @@ test('CORS: disallowed origin gets no CORS headers but is still processed', asyn
   eq(corsHeaders('https://evil.example', prefixes), {});
   eq(corsHeaders(null, prefixes), {});
   eq(corsHeaders(EXT_ORIGIN, prefixes)['Access-Control-Allow-Origin'], EXT_ORIGIN);
+});
+
+test('CORS: clients.js is the only source of allowed origins; the old env var is ignored', async () => {
+  const w = createWorld({ ALLOWED_ORIGIN_PREFIXES: 'https://evil.example' });
+  let res = await w.send('/v1/health', { key: null, instance: null, origin: 'https://evil.example' });
+  eq(res.headers.get('access-control-allow-origin'), null, 'an origin only the env var allows gets no CORS');
+  res = await w.send('/v1/health', { key: null, instance: null, origin: EXT_ORIGIN });
+  eq(res.headers.get('access-control-allow-origin'), EXT_ORIGIN, 'a clients.js origin does, with the env var unset or wrong');
 });
 
 test('CORS: preflight is 204 without auth or upstream calls', async () => {
