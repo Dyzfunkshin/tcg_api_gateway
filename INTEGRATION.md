@@ -86,16 +86,85 @@ The session is not tied to the visitor's IP. It may read prices (quote, max
 history, product facts, games lists, the catalog manifest, artifacts and images.
 It cannot write, look up products in bulk, or spend JustTCG budget.
 
-Public responses are edge-cached (`X-Gateway-Cache: hit | miss | partial`):
-artifacts for a year, images a day, the manifest 60 s, everything else an hour.
-Quote batches are cached item by item, so a repeat card is answered from the edge
-and only new items reach pricing.
+### poke-guide client contract
 
-Session errors: `403 origin_not_allowed` (Origin not allowed), `403
-turnstile_failed` (challenge not solved, or solved on another site), `503
-turnstile_unavailable` (retry after `Retry-After`), `503 session_not_configured`,
-`401 session_invalid` (bad, foreign or wrong-origin token), `401
-session_expired`.
+**Session lifecycle.** `POST /v1/session`, body `{"turnstileToken": "<widget token>"}`,
+`Content-Type: application/json`, no `Authorization` header. Success is
+`200 {token, expiresAt, ttlSeconds}` with `Cache-Control: no-store`. The token lives
+`SESSION_TTL_SECONDS` (default **1800 s**, 30 minutes). Refresh it *before*
+`expiresAt` (get a fresh widget token and call `/v1/session` again). If any call
+still returns `401` (`session_expired` or `session_invalid`), re-issue the session
+**once** and retry the call once; if that fails too, surface the error. Never send
+the old token to `/v1/session`: a credential sent there is checked, and an expired
+one is refused.
+
+**Routes poke-guide may call** (exactly its policy in `src/clients.js`; anything
+else is `403 forbidden`):
+
+| Route | Edge cache TTL |
+|---|---|
+| `POST /pricing/v1/prices/quote` (max 100 items) | 1 h, per item |
+| `GET /pricing/v1/prices/product/<digits>` | 1 h |
+| `GET /pricing/v1/history`, `/history/printings`, `/history/coverage` | 1 h |
+| `GET /pricing/v1/games` | 1 h |
+| `GET /catalog/v1/manifest.json` | 60 s |
+| `GET /catalog/v1/artifacts/<file>` | 1 year (content-hashed, immutable) |
+| `GET /catalog/v1/images/<file>` | 24 h |
+| `GET /catalog/v1/products/<digits>` | 1 h |
+| `GET /catalog/v1/games` | 1 h |
+
+**Errors a public client should handle** (all JSON `{error, ...}`):
+
+| Status | `error` | Meaning / action |
+|---|---|---|
+| 401 | `session_invalid` | bad, foreign or wrong-origin token: re-issue once |
+| 401 | `session_expired` | token past `expiresAt`: re-issue once |
+| 403 | `forbidden` | route not in the poke-guide policy |
+| 403 | `origin_not_allowed` | `Origin` is not one of the client's origins |
+| 403 | `turnstile_failed` | challenge not solved, or solved on another site |
+| 413 | `payload_too_large` | body over 1 MB |
+| 413 | `batch_too_large` (`{"error":"batch_too_large","max":100}`) | quote batch over 100 items: split it |
+| 429 | `quota_exceeded` (`scope: "minute"`) | back off for the `Retry-After` seconds |
+| 502 | `origin_unavailable` | the service failed or is unreachable |
+| 503 | `turnstile_unavailable` | Turnstile down: retry after `Retry-After` |
+| 503 | `session_not_configured` / `origin_not_configured` | gateway misconfigured |
+
+**CORS.** The gateway answers preflights (`OPTIONS`, 204) and sets
+`Access-Control-Allow-Origin` only on an **exact** match of the request `Origin`
+against the client origins (`https://poke-guide.com`, preview
+`https://dyzfunkshin.github.io`); `Vary: Origin` is always set with it. Allowed
+request headers: `authorization, content-type, x-instance-id`; methods `GET, POST,
+OPTIONS`. Exposed response headers: `X-Quota-Remaining, Retry-After, ETag,
+X-Gateway-Cache`.
+
+**Caching.** Public responses are edge-cached and carry
+`X-Gateway-Cache: hit | miss | partial` (`partial` only for quotes, where some
+items came from the edge). `Cache-Control: public, max-age=<TTL>` uses the TTLs in
+the table above; only `200` answers are cached. Quote batches are cached item by
+item (the quote response itself is `no-store`), so a repeat card is answered from
+the edge and only new items reach pricing. `ETag` is passed through.
+
+### Compression
+
+Large JSON (a catalog artifact is ~50 MB raw; the price snapshot file below is
+similar in kind) is **streamed** by the gateway, not buffered. The gateway keeps the
+upstream `content-type`, never adds `Cache-Control: no-transform`, and does not set
+`Content-Encoding` itself. Cloudflare's edge compresses the response (br/gzip) for
+clients that send `Accept-Encoding`, so the browser receives
+`Content-Encoding: br` or `gzip` and decodes it transparently. Wire compression is
+verified by a live probe (`curl -H 'Accept-Encoding: br' -I` on a large artifact)
+once the gateway is live, not by the offline tests.
+
+### Pending routes (not yet available)
+
+**PENDING on `tcg_pricing_service` and NOT yet allow-listed in the gateway: both
+return `404 not_found` today.** They will be added to `src/routes.js` and to the
+poke-guide policy only after pricing's own `INTEGRATION.md` documents them.
+
+- `GET /pricing/v1/prices/snapshot/manifest.json`: revalidating (short TTL);
+  `{version, file, bytes, sha256, asOf}` naming the current snapshot file.
+- `GET /pricing/v1/prices/snapshot/<file>`: content-hashed, immutable (long TTL);
+  same shape as poke-guide's `prices.json`: `{currency, asOf, byProduct}`.
 
 ## What the gateway adds and removes
 
