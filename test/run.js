@@ -185,6 +185,34 @@ test('auth: 401 without key (credential_required), malformed header (credential_
   eq(w.calls.length, 0);
 });
 
+// Security log events: the structured events (name + fields) a deny decision emits.
+function eventsNamed(world, name) {
+  return world.logs.filter(([event]) => event === name).map(([, fields]) => fields);
+}
+
+test('log credential_invalid: unsupported scheme, malformed bearer, missing instance and anonymous-on-protected each log once', async () => {
+  const w = createWorld();
+  const ip = { 'cf-connecting-ip': '9.9.9.9' };
+  await w.send('/v1/license', { key: null, headers: { authorization: 'Basic abc-secret-basic', ...ip } });
+  let events = eventsNamed(w, 'credential_invalid');
+  eq([events.length, events[0].reason, events[0].ip], [1, 'unsupported scheme', '9.9.9.9']);
+  await w.send('/v1/license', { key: null, headers: { authorization: 'Bearer short', ...ip } });
+  events = eventsNamed(w, 'credential_invalid');
+  eq([events.length, events[1].reason], [2, 'malformed bearer value']);
+  await w.send('/v1/license', { instance: null, headers: ip });
+  events = eventsNamed(w, 'credential_invalid');
+  eq(events.length, 3);
+  ok(events[2].reason.startsWith('license_required'));
+  eq(events[2].key.length, 8, 'a licence key is logged as its 8-char hash prefix only');
+  await w.send('/v1/license', { key: null, instance: null, headers: ip });
+  events = eventsNamed(w, 'credential_invalid');
+  eq([events.length, events[3].reason, events[3].client], [4, 'credential_required', 'anonymous']);
+  // allow case: a valid request logs no credential_invalid
+  const good = createWorld();
+  eq((await good.send('/v1/license')).status, 200);
+  eq(eventsNamed(good, 'credential_invalid').length, 0);
+});
+
 test('licenseKeyFrom parses bearer keys only', async () => {
   const r = (value) => new Request('https://x.test/', { headers: value ? { authorization: value } : {} });
   eq(licenseKeyFrom(r('Bearer ' + KEY)), KEY);
@@ -515,6 +543,17 @@ test('daily quota: 429 with scope day and Retry-After; remaining header counts d
   const dayKey = [...w.kv.store.keys()].find((k) => k.startsWith('q:'));
   ok(dayKey.endsWith(':2026-11-05'));
   eq(w.kv.ttls.get(dayKey), 172800);
+});
+
+test('log quota_exceeded: a daily refusal logs once with the key hash prefix, never the key', async () => {
+  const w = createWorld({ DAILY_QUOTA: '1' });
+  eq((await w.send('/v1/license', { headers: { 'cf-connecting-ip': '5.5.5.5' } })).status, 200);
+  eq(eventsNamed(w, 'quota_exceeded').length, 0, 'an allowed request logs nothing');
+  eq((await w.send('/v1/license', { headers: { 'cf-connecting-ip': '5.5.5.5' } })).status, 429);
+  const events = eventsNamed(w, 'quota_exceeded');
+  eq(events.length, 1);
+  eq([events[0].client, events[0].subjectKind, events[0].subject.length, events[0].ip], ['sourcery', 'license', 8, '5.5.5.5']);
+  ok(!JSON.stringify(w.logs).includes(KEY));
 });
 
 test('minute quota: 429 with scope minute and Retry-After', async () => {
@@ -1237,6 +1276,16 @@ test('quote batch cap: a policy maxQuoteItems refuses larger batches with 413', 
   eq(res.status, 400);
 });
 
+test('log rate_limited: the in-memory per-minute refusal logs once with limiter memory', async () => {
+  const w = createWorld({ BURST_PER_MINUTE: '1' });
+  eq((await w.send('/v1/license')).status, 200);
+  eq(eventsNamed(w, 'rate_limited').length, 0);
+  eq((await w.send('/v1/license')).status, 429);
+  const events = eventsNamed(w, 'rate_limited');
+  eq(events.length, 1);
+  eq([events[0].client, events[0].limiter, events[0].subjectKind, events[0].subject.length], ['sourcery', 'memory', 'license', 8]);
+});
+
 test('rate-limiting binding: decides per-minute limits when present, keyed per licence key', async () => {
   const limiter = fakeRateLimiter(2);
   const w = createWorld({ RATE_LIMIT_LICENSE: limiter, BURST_PER_MINUTE: '1' });
@@ -1246,6 +1295,23 @@ test('rate-limiting binding: decides per-minute limits when present, keyed per l
   eq([res.status, res.headers.get('retry-after'), (await readJson(res)).scope], [429, '60', 'minute']);
   eq(new Set(limiter.keys).size, 1);
   ok(!limiter.keys[0].includes(KEY), 'the binding key is a hash, never the licence key');
+});
+
+test('log rate_limited: a binding refusal logs the binding name and ip subject; an app key logs its app id', async () => {
+  const w = createWorld({ RATE_LIMIT_PUBLIC: fakeRateLimiter(1) });
+  const anon = () => w.send('/v1/health', { key: null, instance: null, headers: { 'cf-connecting-ip': '1.1.1.1' } });
+  await anon();
+  eq(eventsNamed(w, 'rate_limited').length, 0);
+  await anon();
+  const events = eventsNamed(w, 'rate_limited');
+  eq(events.length, 1);
+  eq([events[0].client, events[0].limiter, events[0].subjectKind, events[0].subject, events[0].ip], ['anonymous', 'RATE_LIMIT_PUBLIC', 'ip', '1.1.1.1', '1.1.1.1']);
+  const app = await createAppWorld({}, { RATE_LIMIT_APP: fakeRateLimiter(0) });
+  const res = await app.send('/catalog/v1/manifest.json', { key: APP_KEY, instance: null });
+  eq(res.status, 429);
+  const appEvents = eventsNamed(app, 'rate_limited');
+  eq([appEvents.length, appEvents[0].client, appEvents[0].subjectKind, appEvents[0].subject], [1, 'test-backend', 'app', 'test-backend']);
+  ok(!JSON.stringify(app.logs).includes(APP_KEY));
 });
 
 test('rate-limiting binding: anonymous calls are limited per IP; a binding error fails open', async () => {
@@ -1532,6 +1598,97 @@ test('session token: tampered, foreign-key and malformed tokens are 401 session_
     eq([res.status, await readJson(res)], [401, { error: 'session_invalid' }], bad.slice(0, 20));
   }
   eq(w.originCalls(CATALOG).length, 0);
+});
+
+test('log session_expired and session_invalid origin mismatch: each logs once with reason and ip', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue(SITE, '1.1.1.1');
+  await w.publicSend('/catalog/v1/manifest.json', token, { origin: PREVIEW, ip: '6.6.6.6' });
+  const invalid = eventsNamed(w, 'session_invalid');
+  eq([invalid.length, invalid[0].reason, invalid[0].ip], [1, 'origin mismatch', '6.6.6.6']);
+  eq(eventsNamed(w, 'session_expired').length, 0);
+  w.clock.t += 1800 * 1000;
+  await w.publicSend('/catalog/v1/manifest.json', token, { ip: '6.6.6.6' });
+  const expired = eventsNamed(w, 'session_expired');
+  eq([expired.length, expired[0].client, expired[0].ip], [1, 'poke-guide', '6.6.6.6']);
+  eq(eventsNamed(w, 'session_invalid').length, 1, 'expiry is its own event, not session_invalid');
+  ok(!JSON.stringify(w.logs).includes(token));
+});
+
+test('log session_refused: origin_not_allowed, bad body and failed Turnstile each log once with a reason', async () => {
+  const w = createPublicWorld();
+  const post = (origin, body) => w.send('/v1/session', { method: 'POST', key: null, instance: null, origin, body, headers: { 'cf-connecting-ip': '7.7.7.7' } });
+  eq((await post('https://evil.example', { turnstileToken: 'SECRET-TS' })).status, 403);
+  let events = eventsNamed(w, 'session_refused');
+  eq([events.length, events[0].reason, events[0].ip], [1, 'origin_not_allowed', '7.7.7.7']);
+  eq((await post(SITE, { nope: 1 })).status, 400);
+  events = eventsNamed(w, 'session_refused');
+  eq([events.length, events[1].reason, events[1].client], [2, 'bad body', 'poke-guide']);
+  w.turnstile = { success: false, hostname: 'poke-guide.com', action: 'gateway-session' };
+  eq((await post(SITE, { turnstileToken: 'SECRET-TS' })).status, 403);
+  events = eventsNamed(w, 'session_refused');
+  eq([events.length, events[2].reason], [3, 'turnstile']);
+  w.turnstile = { success: true, hostname: 'poke-guide.com', action: 'gateway-session' };
+  eq((await post(SITE, { turnstileToken: 'widget-token' })).status, 200);
+  eq(eventsNamed(w, 'session_refused').length, 3, 'a successful exchange logs no refusal');
+  ok(!JSON.stringify(w.logs).includes('SECRET-TS'));
+});
+
+test('log request_rejected: batch_too_large and payload_too_large each log once', async () => {
+  const w = await createAppWorld({ maxQuoteItems: 2 });
+  await w.send('/pricing/v1/prices/quote', { method: 'POST', body: [{ productId: 1 }, { productId: 2 }], key: APP_KEY, instance: null });
+  eq(eventsNamed(w, 'request_rejected').length, 0);
+  await w.send('/pricing/v1/prices/quote', { method: 'POST', body: [{ productId: 1 }, { productId: 2 }, { productId: 3 }], key: APP_KEY, instance: null, headers: { 'cf-connecting-ip': '8.8.8.8' } });
+  let events = eventsNamed(w, 'request_rejected');
+  eq(events.length, 1);
+  eq([events[0].reason, events[0].route, events[0].client, events[0].ip, events[0].count, events[0].max], ['batch_too_large', 'pricing:quote', 'test-backend', '8.8.8.8', 3, 2]);
+  const res = await w.send('/pricing/v1/prices/quote', { method: 'POST', body: 'x'.repeat(1024 * 1024 + 1), key: APP_KEY, instance: null });
+  eq(res.status, 413);
+  events = eventsNamed(w, 'request_rejected');
+  eq([events.length, events[1].reason], [2, 'payload_too_large']);
+});
+
+test('log sweep: no deny-path event ever carries a raw licence key, app key, session token, Turnstile token or Authorization header', async () => {
+  const FAKE_LICENSE = 'FAKELICENSEKEY-9f8e7d6c5b4a';
+  const FAKE_APP = 'fakeappkey' + 'e'.repeat(54);
+  const FAKE_SESSION = 'v1.FAKESESSIONPAYLOAD.FAKESESSIONSIG';
+  const FAKE_TURNSTILE = 'FAKE-TURNSTILE-TOKEN-xyz';
+  const secrets = [FAKE_LICENSE, FAKE_APP, FAKE_SESSION, FAKE_TURNSTILE, 'FAKESESSIONPAYLOAD', 'Bearer ', 'Session '];
+  const allLogs = [];
+
+  const pub = createPublicWorld({ RATE_LIMIT_SESSION: fakeRateLimiter(0) });
+  pub.turnstile = { success: false, hostname: 'poke-guide.com', action: 'gateway-session' };
+  const session = (origin, body) => pub.send('/v1/session', { method: 'POST', key: null, instance: null, origin, body, headers: { 'cf-connecting-ip': '1.2.3.4' } });
+  await session(SITE, { turnstileToken: FAKE_TURNSTILE });
+  await session('https://evil.example', { turnstileToken: FAKE_TURNSTILE });
+  await session(SITE, { turnstileToken: 7 });
+  await pub.publicSend('/catalog/v1/manifest.json', FAKE_SESSION);
+  await pub.send('/pricing/v1/games', { key: null, instance: null, origin: SITE, headers: { authorization: 'Session ' + FAKE_SESSION, 'cf-connecting-ip': '1.2.3.4' } });
+  allLogs.push(...pub.logs);
+
+  const lic = createWorld({ DAILY_QUOTA: '1', RATE_LIMIT_LICENSE_ATTEMPTS: fakeRateLimiter(0) });
+  lic.responders.validate = () => jsonResponse(notFound('License key does not exist.'), 404);
+  await lic.send('/v1/license', { key: FAKE_LICENSE, instance: null });
+  await lic.send('/v1/license', { key: null, headers: { authorization: 'Basic ' + FAKE_LICENSE } });
+  await lic.send('/v1/license', { key: FAKE_LICENSE, headers: { 'cf-connecting-ip': '1.2.3.4' } });
+  allLogs.push(...lic.logs);
+
+  const quota = createWorld({ DAILY_QUOTA: '1' });
+  await quota.send('/v1/license', { key: FAKE_LICENSE });
+  await quota.send('/v1/license', { key: FAKE_LICENSE });
+  allLogs.push(...quota.logs);
+
+  const app = await createAppWorld({ maxQuoteItems: 1 }, { RATE_LIMIT_APP: fakeRateLimiter(1) });
+  app.deps.clients = { ...app.deps.clients, appKeys: [{ ...app.deps.clients.appKeys[0], keySha256: await sha256Hex(FAKE_APP) }] };
+  await app.send('/pricing/v1/prices/quote', { method: 'POST', body: [{ productId: 1 }, { productId: 2 }], key: FAKE_APP, instance: null });
+  await app.send('/catalog/v1/manifest.json', { key: FAKE_APP, instance: null });
+  await app.send('/catalog/v1/manifest.json', { key: FAKE_APP, instance: null });
+  allLogs.push(...app.logs);
+
+  const names = new Set(allLogs.map(([event]) => event));
+  for (const expected of ['session_refused', 'session_invalid', 'credential_invalid', 'rate_limited', 'request_rejected']) ok(names.has(expected), 'sweep exercised ' + expected);
+  const serialized = JSON.stringify(allLogs);
+  for (const secret of secrets) ok(!serialized.includes(secret), 'log contains ' + secret);
 });
 
 test('public policy: reads only, quote forced to fill none and capped at 100, no writes or lookups', async () => {

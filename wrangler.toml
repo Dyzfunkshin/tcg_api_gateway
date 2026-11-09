@@ -12,6 +12,10 @@ workers_dev = true
 binding = "LICENSES"
 id = "3216419ee1244988a05fc0bad9d7b17c"
 
+# Workers Logs: keeps the structured security events (docs/PLAN.md section 7.2) queryable in the dashboard.
+[observability]
+enabled = true
+
 # Non-secret configuration. Secrets are NOT listed here; set each with
 #   npx wrangler secret put <NAME>
 # Secrets: PRICING_APP_TOKEN, CATALOG_APP_TOKEN, and from G4 ACCESS_CLIENT_ID +
