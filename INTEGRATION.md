@@ -157,14 +157,12 @@ once the gateway is live, not by the offline tests.
 
 ### Pending routes (not yet available)
 
-**PENDING on `tcg_pricing_service` and NOT yet allow-listed in the gateway: both
-return `404 not_found` today.** They will be added to `src/routes.js` and to the
-poke-guide policy only after pricing's own `INTEGRATION.md` documents them.
+**Not allow-listed: both return `404 not_found` today.** The gateway allows a path only
+after the owning service's own `INTEGRATION.md` defines it. What these routes return is
+`tcg_pricing_service`'s contract, not the gateway's.
 
-- `GET /pricing/v1/prices/snapshot/manifest.json`: revalidating (short TTL);
-  `{version, file, bytes, sha256, asOf}` naming the current snapshot file.
-- `GET /pricing/v1/prices/snapshot/<file>`: content-hashed, immutable (long TTL);
-  same shape as poke-guide's `prices.json`: `{currency, asOf, byProduct}`.
+- `GET /pricing/v1/prices/snapshot/manifest.json`
+- `GET /pricing/v1/prices/snapshot/<file>`
 
 ## What the gateway adds and removes
 
