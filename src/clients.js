@@ -59,7 +59,7 @@ export const LICENSE_CLIENT = Object.freeze({
 
 // Server-side apps, one row per app, each with its own key (PLAN.md section 6.4).
 // keySha256 = sha256 hex of the 32-byte key; the plaintext is only in Bitwarden
-// (TCG_GATEWAY_APP_KEY_<APP>, project poke-scans) and the app's own secret store.
+// (TCG_GATEWAY_APP_KEY_<APP>, project api-gateway) and the app's own secret store.
 // Revoke by deleting the row and redeploying. None are onboarded yet.
 export const APP_KEY_CLIENTS = Object.freeze([]);
 

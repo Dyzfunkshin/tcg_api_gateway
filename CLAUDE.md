@@ -41,7 +41,7 @@ npm test        # offline; must stay offline and dependency-free
   policies that name them** (a binding's limit is fixed at deploy).
 - **Never take `x-fill-policy` from a client**; the gateway sets it from policy.
 - **Secrets never appear in code, logs, or output.** Bitwarden (project
-  `poke-scans`) is the source of truth; see PLAN.md section 7. Licence keys are
+  `api-gateway`) is the source of truth; see PLAN.md section 7. Licence keys are
   logged only as a hash prefix.
 - **No deploy, secret push, or Cloudflare API call** until the owner confirms
   the Cloudflare token's Workers permissions (PLAN.md section 8, build gates).

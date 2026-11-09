@@ -61,7 +61,7 @@ as a licence when `X-Instance-Id` is present. **A credential that is present but
 invalid is always refused with 401**; it never falls back to anonymous access.
 
 To get an app key, add a policy row to `src/clients.js` (routes, fill policy,
-quota) and store the key in Bitwarden (project `poke-scans`,
+quota) and store the key in Bitwarden (project `api-gateway`,
 `TCG_GATEWAY_APP_KEY_<APP>`); see [docs/PLAN.md](docs/PLAN.md) section 6.4.
 
 ## What the gateway adds and removes
