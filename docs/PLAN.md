@@ -327,6 +327,33 @@ every live session at once. That is acceptable: tokens last 30 minutes
 - **Expected effect:** each active visitor gets one 401 and silently re-issues
   a session.
 
+### 7.2 Security log events
+
+Every security-relevant deny decision emits exactly one structured event
+through `deps.log(event, fields)` (`console.log` of JSON in production, kept by
+Workers Logs: `[observability]` in `wrangler.toml`). Event names are stable;
+log queries depend on them, so never rename one. No event ever carries a
+session token, Turnstile token, raw licence or app key, Authorization header,
+or secret: licence keys appear only as the 8-character hash prefix (`key`, or
+`subject` with `subjectKind: license`), app keys only as the app id. `ip` is
+`cf-connecting-ip`.
+
+| Event | Fires when | Fields |
+|---|---|---|
+| `credential_invalid` | 401 for an unusable credential: unsupported scheme, malformed bearer value, Bearer licence without a valid `X-Instance-Id` (`license_required`), or an anonymous call to a protected route (`credential_required`) | `reason`, `ip`; `key` (hash prefix) for the instance case; `client`, `route` for `credential_required` |
+| `license_rejected` / `license_not_found` / `license_service_unavailable` / `license_attempts_limited` | licence verdict refused, unknown, Polar unreachable, or per-IP attempt cap hit | `key` (hash prefix), `reason`/`detail`/`status`, `ip` |
+| `session_refused` | `POST /v1/session` refused: `origin_not_allowed`, `bad body`, `turnstile`, `hostname`, `action mismatch` | `reason`, `client` (except origin_not_allowed), `ip`, plus `origin` / `errorCodes` / `hostname` / `action` as relevant |
+| `session_invalid` | session token bad signature, unknown client, origin mismatch, or signing key unset | `reason`, `ip` |
+| `session_expired` | a correctly signed session token past its expiry | `client`, `ip` |
+| `route_forbidden` | 403, the client's policy does not allow the route | `route`, `client` |
+| `rate_limited` | per-minute refusal, from a rate-limit binding or the in-memory counter | `client`, `route`, `limiter` (binding name or `memory`), `subjectKind` (`ip`, `app`, `license`), `subject` (ip, app id, or hash prefix), `ip` |
+| `quota_exceeded` | daily quota refusal | `client`, `route`, `subjectKind`, `subject`, `ip` |
+| `request_rejected` | 413: `reason` is `payload_too_large` or `batch_too_large` | `reason`, `route`, `client`, `ip`; `count`, `max` for batches |
+| `rate_limiter_unavailable`, `access_misconfigured`, `session_not_configured` | operational failures (fail open / 503) | `binding` or `reason`/`missing`, `error` |
+
+Alerting on these events is a separate, deploy-gated task (#9); this section
+only fixes the names and fields it will key on.
+
 ## 8. Migration plan (in order; each step is shippable on its own)
 
 | # | Step | Repo(s) | Done when |
@@ -430,3 +457,31 @@ sections above):
     (enforced by `assertValidClients`). Quote items are cached only when they
     carry nothing but `game`, exactly one of `productId`/`skuId`, `condition`,
     `printing`; absent selectors are not defaulted in the key.
+
+**2026-11-09, security logging (task #5):**
+
+16. Every deny decision logs exactly one stable-named event, and no event may
+    contain a secret or raw credential (section 7.2). Existing event names are
+    unchanged; new ones are `credential_invalid`, `rate_limited`,
+    `quota_exceeded`, `session_expired` and `request_rejected`, plus `reason`
+    fields on the previously silent `/v1/session` refusals. Workers Logs is
+    enabled in `wrangler.toml`. Alerting is deferred to task #9.
+
+**2026-11-09, security hardening (owner decisions, tasks #3 and #6):**
+
+17. **Licence flood guard.** A licence lookup that may reach the edge cache,
+    KV or Polar first spends one attempt from `RATE_LIMIT_LICENSE_ATTEMPTS`,
+    keyed by IP, at **20 per IP per minute** (owner's choice). A verdict still
+    fresh in isolate memory is free, so a real Sourcery user spends about one
+    attempt per 10 minutes. Over the limit, the answer is
+    `429 license_attempts_exceeded` with `Retry-After: 60`. The same guard
+    covers `/v1/license/activate` and `/v1/license/deactivate`. Polar
+    "not found" verdicts live in isolate memory only, so a random key never
+    costs a KV write. The verdict memory is capped at 1000 entries. As with
+    every other binding, the guard fails open if the limiter errors.
+18. **Turnstile action.** Every public-session client names a
+    `turnstileAction`; poke-guide's is `gateway-session`. `/v1/session`
+    refuses a token whose siteverify `action` differs, with
+    `403 turnstile_failed`, the same code as any other Turnstile failure.
+    This stops a token from another widget on the same hostname buying a
+    session. poke_guide was notified through the huddle's notices.
