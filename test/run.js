@@ -1054,7 +1054,7 @@ test('licence client: routes outside its policy are 403 forbidden, never forward
     ['/catalog/v1/manifest.json', 'GET'],
     ['/catalog/v1/tags', 'GET'],
     ['/catalog/v1/tags/mew%7C25', 'POST'],
-    ['/pricing/v1/health', 'GET'],
+    ['/catalog/v1/health', 'GET'],
   ]) {
     const res = await w.send(path, { method, body: method === 'POST' ? {} : undefined });
     eq([res.status, await readJson(res)], [403, { error: 'forbidden' }], path);
@@ -1207,6 +1207,41 @@ test('policy table: the shipped table is valid; malformed rows are rejected', as
   let threw = false;
   try { assertValidClients({ ...DEFAULT_CLIENTS, anonymous: { ...ANONYMOUS_CLIENT, routes: ['pricing:quote'] } }); } catch { threw = true; }
   ok(threw, 'the anonymous client may not be granted data routes');
+});
+
+// ---------- G2: pricing health open through the gateway ----------
+
+test('pricing health: open to anonymous callers, forwarded to pricing /v1/health, never spends budget', async () => {
+  const w = createWorld();
+  const healthBody = { ok: true, tcgcsv: { lastSyncAt: '2026-11-09T00:00:00Z' } };
+  w.responders.pricing = () => jsonResponse(healthBody);
+  const res = await w.send('/pricing/v1/health', { key: null, instance: null });
+  eq([res.status, await readJson(res)], [200, healthBody]);
+  const call = lastUpstream(w, PRICING);
+  eq([call.url, call.method, call.headers['x-fill-policy']], [PRICING + '/v1/health', 'GET', 'none']);
+  eq(res.headers.get('x-quota-remaining'), null, 'anonymous calls carry no daily quota');
+  eq((await w.send('/pricing/v1/health', { method: 'POST', key: null, instance: null })).status, 405);
+});
+
+test('pricing health: licence and app-key callers may reach it too; catalog health stays closed', async () => {
+  const w = await createAppWorld();
+  eq((await w.send('/pricing/v1/health')).status, 200, 'licence');
+  eq((await w.send('/pricing/v1/health', { key: APP_KEY, instance: null })).status, 200, 'app key');
+  eq((await w.send('/catalog/v1/health', { key: null, instance: null })).status, 401);
+});
+
+test('pricing health: an unreachable pricing origin is a 502 the alert can see', async () => {
+  const w = createWorld();
+  w.responders.pricing = () => new Response('boom', { status: 503 });
+  eq((await w.send('/pricing/v1/health', { key: null, instance: null })).status, 502);
+});
+
+test('pricing health: anonymous calls are per-IP limited by the public binding', async () => {
+  const limiter = fakeRateLimiter(1);
+  const w = createWorld({ RATE_LIMIT_PUBLIC: limiter });
+  const headers = { 'cf-connecting-ip': '9.9.9.9' };
+  eq((await w.send('/pricing/v1/health', { key: null, instance: null, headers })).status, 200);
+  eq((await w.send('/pricing/v1/health', { key: null, instance: null, headers })).status, 429);
 });
 
 // ---------- runner ----------

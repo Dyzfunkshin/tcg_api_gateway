@@ -18,8 +18,10 @@
 //   cache       edge-cache rules, or null (edge caching arrives at G5)
 import { ROUTE_IDS } from './routes.js';
 
-// Routes every caller may reach, credential or not.
-const OPEN_ROUTES = ['gateway:health', 'gateway:license.activate'];
+// Routes every caller may reach, credential or not. pricing:health is open for
+// pricing's tcgcsv freshness alert (PLAN.md section 4, step G2); pricing serves it
+// without a token anyway, and it is read-only.
+const OPEN_ROUTES = ['gateway:health', 'gateway:license.activate', 'pricing:health'];
 
 // The client for a request with no Authorization header at all. Only ever the open
 // routes; per-IP limited when the RATE_LIMIT_PUBLIC binding exists.

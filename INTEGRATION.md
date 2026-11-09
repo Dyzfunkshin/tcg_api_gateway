@@ -27,7 +27,7 @@ Request and response bodies are the services' own: **each service's
 
 | Route | Service route |
 |---|---|
-| `GET /pricing/v1/health` | pricing health |
+| `GET /pricing/v1/health` | pricing health — **open to every caller, no credential** (used by pricing's tcgcsv freshness alert) |
 | `POST /pricing/v1/prices/quote` | quote (JSON array body) |
 | `GET /pricing/v1/prices/product/<digits>` | per-product prices |
 | `GET /pricing/v1/history`, `/history/printings`, `/history/coverage` | price history |
@@ -54,7 +54,7 @@ Send exactly one credential:
 |---|---|
 | Server-side app | `Authorization: Bearer <app key>` (64 hex chars, issued per app) |
 | Sourcery extension | `Authorization: Bearer <licence key>` + `X-Instance-Id: <activation id>` |
-| Open routes only | no `Authorization` header |
+| Open routes only (`GET /v1/health`, `POST /v1/license/activate`, `GET /pricing/v1/health`) | no `Authorization` header (per-IP rate limited) |
 
 App keys are matched first (by SHA-256); a key that is not an app key is treated
 as a licence when `X-Instance-Id` is present. **A credential that is present but
