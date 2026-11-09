@@ -436,7 +436,11 @@ async function forward(request, target, extraHeaders, body, deps) {
     if (value) responseHeaders[name] = value;
   }
   const hasNoBody = [204, 205, 304].includes(upstream.status);
-  return new Response(hasNoBody ? null : await upstream.arrayBuffer(), { status: upstream.status, headers: responseHeaders });
+  // GETs are streamed through (a catalog artifact is ~50 MB: never held whole in the isolate).
+  // Other methods stay buffered: their bodies are small JSON that callers parse.
+  const streams = request.method === 'GET' && !hasNoBody;
+  const responseBody = hasNoBody ? null : streams ? upstream.body : await upstream.arrayBuffer();
+  return new Response(responseBody, { status: upstream.status, headers: responseHeaders });
 }
 
 // ---------- route handlers ----------
@@ -593,10 +597,12 @@ async function cachedGet(request, target, headers, cacheUrl, ttlSeconds, deps) {
   }
   const response = await forward(request, target, headers, undefined, deps);
   if (response.status !== 200) return response;
-  const body = await response.arrayBuffer();
   const kept = headersOf(response);
-  await cachePut(deps.cache, cacheUrl, body, kept, ttlSeconds, deps.log);
-  return new Response(body, { status: 200, headers: { ...kept, 'cache-control': `public, max-age=${ttlSeconds}`, 'x-gateway-cache': 'miss' } });
+  // One branch to the client, one to the cache. The write is handed to waitUntil, not awaited:
+  // an unread tee branch would otherwise buffer the whole body in memory.
+  const [toClient, toCache] = response.body ? response.body.tee() : [null, null];
+  if (toCache) deps.waitUntil(cachePut(deps.cache, cacheUrl, toCache, kept, ttlSeconds, deps.log));
+  return new Response(toClient, { status: 200, headers: { ...kept, 'cache-control': `public, max-age=${ttlSeconds}`, 'x-gateway-cache': 'miss' } });
 }
 
 // A quote batch split per item: cached items are answered from the edge, only the misses
@@ -803,6 +809,8 @@ export async function handle(request, env, deps = {}) {
     log: deps.log || ((event, fields) => console.log(JSON.stringify({ event, ...fields }))),
     clients: deps.clients || DEFAULT_CLIENTS,
     cache: deps.cache !== undefined ? deps.cache : edgeCache(),
+    // Background work that outlives the response (cache writes). Errors are logged, never thrown.
+    waitUntil: deps.waitUntil || ((promise) => { Promise.resolve(promise).catch((error) => (deps.log || console.log)('background_failed', { error: String(error && error.message) })); }),
   };
   const cors = corsHeaders(request.headers.get('origin'), corsOriginsOf(resolved.clients));
 
@@ -823,6 +831,6 @@ export async function handle(request, env, deps = {}) {
 
 export default {
   fetch(request, env, ctx) {
-    return handle(request, env, {});
+    return handle(request, env, ctx && typeof ctx.waitUntil === 'function' ? { waitUntil: ctx.waitUntil.bind(ctx) } : {});
   },
 };
