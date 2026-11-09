@@ -5,7 +5,8 @@ The single front door to the TCG services: one Cloudflare Worker at
 pricing and catalog stay private on the Droplet.
 
 The full plan (scope, routes, client policies, origin lock, secrets, migration
-order) is in [docs/PLAN.md](docs/PLAN.md).
+order) is in [docs/PLAN.md](docs/PLAN.md). The HTTP contract for consumers is
+[INTEGRATION.md](INTEGRATION.md).
 
 ```
 npm test          # offline, no dependencies, Node 22+

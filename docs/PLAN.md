@@ -1,7 +1,9 @@
 # TCG API gateway — the single front door
 
 **Status:** plan, agreed in principle 2026-11-08; open points settled
-2026-11-09 (section 11). G0–G1 are being built offline.
+2026-11-09 (section 11). G0 and G1 built and tested offline (branches
+`feature/g0-bootstrap`, `feature/g1-namespaced-routing`); nothing deployed.
+Next gate: owner confirms the Cloudflare token's Workers permissions.
 **Owner repo:** `_services/tcg_api_gateway` (this repo).
 **Replaces:** `_apps/sourcery/gateway` (the Sourcery-only Worker at `api.dyzzyscards.com`).
 
@@ -187,8 +189,10 @@ appears.
 5. Serve from the edge cache if the policy allows it and there is a fresh hit.
 6. Forward: strip **every** client header except `content-type` and `accept`
    (as today), then add `CF-Access-Client-Id`, `CF-Access-Client-Secret`,
-   `x-app-token` for that service, and, for pricing quotes, `x-fill-policy`
-   from the policy. Body size cap of 1 MB (as today).
+   `x-app-token` for that service, and, on **every** pricing request (not
+   only quotes, since pricing treats an absent header as `default`),
+   `x-fill-policy` from the policy. Body size cap of 1 MB (as today). The
+   Access headers are added at G4.
 7. Copy back only status, `content-type`, body, `ETag` and caching headers.
    Add CORS headers for an allowed `Origin`.
 

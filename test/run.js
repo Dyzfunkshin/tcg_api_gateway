@@ -1,7 +1,9 @@
 // Sourcery gateway tests. Plain node:assert, no dependencies.
 // Run: node gateway/test/run.js   (exits non-zero on any failure)
 import assert from 'node:assert/strict';
-import { handle, licenseKeyFrom, corsHeaders, quotaKeys, resetQuotaMemory } from '../src/worker.js';
+import { handle, licenseKeyFrom, corsHeaders, corsPrefixesOf, quotaKeys, resetQuotaMemory } from '../src/worker.js';
+import { DEFAULT_CLIENTS, LICENSE_CLIENT, ANONYMOUS_CLIENT, assertValidClients } from '../src/clients.js';
+import { matchPath } from '../src/routes.js';
 
 let checkCount = 0;
 const eq = (actual, expected, message) => {
@@ -167,15 +169,17 @@ test('health: ok without auth and reports configured origins, no upstream call',
   eq(w.calls.length, 0);
 });
 
-test('auth: 401 license_required without key, malformed header, or missing instance', async () => {
+test('auth: 401 without key (credential_required), malformed header (credential_invalid), or missing instance (license_required)', async () => {
   const w = createWorld();
   let res = await w.send('/v1/license', { key: null });
   eq(res.status, 401);
-  eq(await readJson(res), { error: 'license_required' });
+  eq(await readJson(res), { error: 'credential_required' });
   res = await w.send('/v1/license', { key: null, headers: { authorization: 'Basic abc' } });
   eq(res.status, 401);
+  eq(await readJson(res), { error: 'credential_invalid' });
   res = await w.send('/v1/license', { key: null, headers: { authorization: 'Bearer ' } });
   eq(res.status, 401);
+  eq(await readJson(res), { error: 'credential_invalid' });
   res = await w.send('/v1/license', { instance: null });
   eq(res.status, 401);
   eq(await readJson(res), { error: 'license_required' });
@@ -611,7 +615,8 @@ test('games lists: /v1/prices/games and /v1/catalog/games reach each origin\'s /
   eq(await readJson(res), pricingGames);
   eq(res.headers.get('cache-control'), 'private, max-age=3600', 'an origin that sends no cache header gets the hour');
   let call = w.calls.find((c) => c.url.startsWith(PRICING));
-  eq([call.url, call.method, call.headers['x-app-token'], call.headers['x-fill-policy']], [PRICING + '/v1/games', 'GET', 'pricing-secret', undefined]);
+  // every pricing request carries the policy's fill policy (pricing treats an absent header as "default")
+  eq([call.url, call.method, call.headers['x-app-token'], call.headers['x-fill-policy']], [PRICING + '/v1/games', 'GET', 'pricing-secret', 'none']);
   res = await w.send('/v1/catalog/games');
   eq(res.status, 200);
   eq(await readJson(res), catalogGames);
@@ -682,9 +687,10 @@ test('CORS: disallowed origin gets no CORS headers but is still processed', asyn
   eq(res.status, 200);
   eq(res.headers.get('access-control-allow-origin'), null);
   eq(res.headers.get('access-control-allow-methods'), null);
-  eq(corsHeaders('https://evil.example', w.env), {});
-  eq(corsHeaders(null, w.env), {});
-  eq(corsHeaders(EXT_ORIGIN, w.env)['Access-Control-Allow-Origin'], EXT_ORIGIN);
+  const prefixes = corsPrefixesOf(DEFAULT_CLIENTS);
+  eq(corsHeaders('https://evil.example', prefixes), {});
+  eq(corsHeaders(null, prefixes), {});
+  eq(corsHeaders(EXT_ORIGIN, prefixes)['Access-Control-Allow-Origin'], EXT_ORIGIN);
 });
 
 test('CORS: preflight is 204 without auth or upstream calls', async () => {
@@ -936,6 +942,264 @@ test('license keys are never logged in full', async () => {
   await w.send('/v1/license', { key: 'abcdefgh-wrong-key-0000' });
   ok(!JSON.stringify(w.logs).includes(KEY));
   ok(!JSON.stringify(w.logs).includes('abcdefgh-wrong-key-0000'));
+});
+
+// ---------- G1: namespaced routing, client policies, legacy aliases ----------
+
+const sha256Hex = async (text) =>
+  [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))].map((b) => b.toString(16).padStart(2, '0')).join('');
+
+const APP_KEY = 'a'.repeat(32) + 'b'.repeat(32); // 32 bytes as hex
+const OTHER_APP_KEY = 'c'.repeat(64);
+
+// A world whose policy table has one app-key client (a stand-in for a server-side app).
+async function createAppWorld({ fillPolicy = 'default', routes, quota, maxQuoteItems = null } = {}, envOverrides = {}) {
+  const w = createWorld(envOverrides);
+  const app = Object.freeze({
+    id: 'test-backend',
+    auth: 'app-key',
+    keySha256: await sha256Hex(APP_KEY),
+    routes: routes ?? ['pricing:quote', 'pricing:history', 'catalog:manifest', 'catalog:artifact'],
+    fillPolicy,
+    quota: quota ?? { daily: 1000, perMinute: 100, perMinuteBinding: 'RATE_LIMIT_APP' },
+    maxQuoteItems,
+    origins: [],
+    cache: null,
+  });
+  w.deps.clients = { ...DEFAULT_CLIENTS, appKeys: [app] };
+  assertValidClients(w.deps.clients);
+  return w;
+}
+
+// A fake Workers rate-limiting binding: allows `limit` calls per key, records keys.
+function fakeRateLimiter(limit) {
+  const counts = new Map();
+  const keys = [];
+  return {
+    keys,
+    async limit({ key }) {
+      keys.push(key);
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+      return { success: counts.get(key) <= limit };
+    },
+  };
+}
+
+const lastUpstream = (w, origin) => w.calls.filter((c) => c.url.startsWith(origin)).at(-1);
+
+test('routes: namespaced paths resolve to service routes; unknown and traversal paths do not', async () => {
+  eq(matchPath('/pricing/v1/prices/quote').routes[0].id, 'pricing:quote');
+  eq(matchPath('/pricing/v1/prices/quote').upstreamPath, '/v1/prices/quote');
+  eq(matchPath('/catalog/v1/artifacts/pokemon.0123abcd.json').routes[0].id, 'catalog:artifact');
+  eq(matchPath('/catalog/v1/products:lookup').routes[0].id, 'catalog:products.lookup');
+  eq(matchPath('/pricing/v1/prices/product/123').routes[0].id, 'pricing:product');
+  eq(matchPath('/pricing/v1/prices/product/abc'), null);
+  eq(matchPath('/catalog/v1/artifacts/.hidden'), null);
+  eq(matchPath('/catalog/v1/artifacts/a/b.json'), null);
+  eq(matchPath('/catalog/v2/manifest.json'), null);
+  eq(matchPath('/pricing/v1/tags'), null, 'a route of one service is not served under the other');
+  eq(matchPath('/other/v1/health'), null);
+  eq(matchPath('/v1/health').routes[0].id, 'gateway:health');
+});
+
+test('routes: every legacy alias maps onto its namespaced route', async () => {
+  const cases = [
+    ['/v1/prices/quote', 'pricing:quote', '/v1/prices/quote'],
+    ['/v1/products:lookup', 'catalog:products.lookup', '/v1/products:lookup'],
+    ['/v1/products/42', 'catalog:products.get', '/v1/products/42'],
+    ['/v1/prices/games', 'pricing:games', '/v1/games'],
+    ['/v1/catalog/games', 'catalog:games', '/v1/games'],
+  ];
+  for (const [path, id, upstream] of cases) {
+    const m = matchPath(path);
+    eq([m.routes[0].id, m.upstreamPath, m.aliasOf], [id, upstream, path], path);
+  }
+});
+
+test('pipeline: 404 and 405 come before any auth work', async () => {
+  const w = createWorld();
+  let res = await w.send('/pricing/v1/nope', { key: 'bad key with spaces', instance: null });
+  eq([res.status, await readJson(res)], [404, { error: 'not_found' }]);
+  res = await w.send('/pricing/v1/prices/quote', { method: 'GET', headers: { authorization: 'Basic x' } });
+  eq(res.status, 405);
+  eq(res.headers.get('allow'), 'POST, OPTIONS');
+  eq(w.calls.length, 0, 'no Polar call, no upstream call');
+});
+
+test('licence client: allowed namespaced routes forward with the tier fill policy', async () => {
+  const w = createWorld({ POLAR_TIERS: BENEFIT_ID + ':pro' });
+  let res = await w.send('/pricing/v1/prices/quote', { method: 'POST', body: [{ productId: 1 }] });
+  eq(res.status, 200);
+  let call = lastUpstream(w, PRICING);
+  eq([call.url, call.headers['x-fill-policy'], call.headers['x-app-token']], [PRICING + '/v1/prices/quote', 'default', 'pricing-secret']);
+  res = await w.send('/catalog/v1/products/77?fields=a');
+  eq(res.status, 200);
+  call = lastUpstream(w, CATALOG);
+  eq([call.url, call.headers['x-fill-policy']], [CATALOG + '/v1/products/77?fields=a', undefined], 'catalog never gets a fill policy');
+  ok(res.headers.get('x-quota-remaining') !== null);
+});
+
+test('licence client: routes outside its policy are 403 forbidden, never forwarded', async () => {
+  const w = createWorld();
+  for (const [path, method] of [
+    ['/pricing/v1/history', 'GET'],
+    ['/pricing/v1/prices/product/1', 'GET'],
+    ['/catalog/v1/manifest.json', 'GET'],
+    ['/catalog/v1/tags', 'GET'],
+    ['/catalog/v1/tags/mew%7C25', 'POST'],
+    ['/pricing/v1/health', 'GET'],
+  ]) {
+    const res = await w.send(path, { method, body: method === 'POST' ? {} : undefined });
+    eq([res.status, await readJson(res)], [403, { error: 'forbidden' }], path);
+  }
+  eq(w.calls.filter((c) => c.url.startsWith(PRICING) || c.url.startsWith(CATALOG)).length, 0);
+});
+
+test('anonymous client: open routes only; data routes are 401 credential_required', async () => {
+  const w = createWorld();
+  eq((await w.send('/v1/health', { key: null, instance: null })).status, 200);
+  for (const path of ['/pricing/v1/games', '/catalog/v1/manifest.json', '/v1/catalog/games']) {
+    const res = await w.send(path, { key: null, instance: null });
+    eq([res.status, await readJson(res)], [401, { error: 'credential_required' }], path);
+  }
+  eq(w.calls.length, 0);
+});
+
+test('legacy aliases still work for Sourcery and each hit is logged', async () => {
+  const w = createWorld();
+  eq((await w.send('/v1/prices/quote', { method: 'POST', body: [] })).status, 200);
+  eq(lastUpstream(w, PRICING).url, PRICING + '/v1/prices/quote');
+  eq((await w.send('/v1/products/5')).status, 200);
+  eq(lastUpstream(w, CATALOG).url, CATALOG + '/v1/products/5');
+  const aliasLogs = w.logs.filter(([event]) => event === 'legacy_alias').map(([, f]) => [f.path, f.route, f.client]);
+  eq(aliasLogs, [['/v1/prices/quote', 'pricing:quote', 'sourcery'], ['/v1/products/5', 'catalog:products.get', 'sourcery']]);
+  eq((await w.send('/pricing/v1/prices/quote', { method: 'POST', body: [] })).status, 200);
+  eq(w.logs.filter(([event]) => event === 'legacy_alias').length, 2, 'namespaced paths are not alias hits');
+});
+
+test('forwarding: only content-type and accept pass; client fill policy and tokens are stripped', async () => {
+  const w = createWorld();
+  await w.send('/pricing/v1/prices/quote', {
+    method: 'POST',
+    body: [],
+    headers: { 'x-fill-policy': 'default', 'x-app-token': 'forged', cookie: 'a=b', 'cf-access-client-id': 'forged', accept: 'application/json' },
+  });
+  const call = lastUpstream(w, PRICING);
+  eq(Object.keys(call.headers).sort(), ['accept', 'content-type', 'x-app-token', 'x-fill-policy']);
+  eq([call.headers['x-fill-policy'], call.headers['x-app-token']], ['none', 'pricing-secret'], 'a basic-tier key cannot ask for fills');
+});
+
+test('app key: matched by hash before any licence lookup, even with X-Instance-Id present', async () => {
+  const w = await createAppWorld({ fillPolicy: 'default' });
+  const res = await w.send('/pricing/v1/history?game=pokemon', { key: APP_KEY, instance: INSTANCE });
+  eq(res.status, 200);
+  eq(w.polarCalls('validate').length, 0, 'no Polar call for an app key');
+  const call = lastUpstream(w, PRICING);
+  eq([call.url, call.headers['x-fill-policy']], [PRICING + '/v1/history?game=pokemon', 'default']);
+  eq(res.headers.get('x-quota-remaining'), '999');
+});
+
+test('app key: policy is least privilege; ungranted routes are 403', async () => {
+  const w = await createAppWorld();
+  for (const path of ['/catalog/v1/products/1', '/v1/license', '/pricing/v1/games']) {
+    const res = await w.send(path, { key: APP_KEY, instance: null });
+    eq([res.status, await readJson(res)], [403, { error: 'forbidden' }], path);
+  }
+  eq((await w.send('/catalog/v1/artifacts/pokemon.abc.json', { key: APP_KEY, instance: null })).status, 200);
+});
+
+test('app key: an unknown key is never anonymous; without X-Instance-Id it is a 401', async () => {
+  const w = await createAppWorld();
+  let res = await w.send('/v1/health', { key: OTHER_APP_KEY, instance: null });
+  eq([res.status, await readJson(res)], [401, { error: 'license_required' }], 'even an open route refuses an invalid credential');
+  res = await w.send('/pricing/v1/history', { key: OTHER_APP_KEY, instance: null });
+  eq(res.status, 401);
+  eq(w.calls.length, 0);
+});
+
+test('invalid licence credential is a 401 on every route, never downgraded to anonymous', async () => {
+  const w = createWorld();
+  w.responders.validate = () => jsonResponse(notFound('License key not found'), 404);
+  for (const [path, method] of [['/v1/health', 'GET'], ['/v1/license/activate', 'POST'], ['/pricing/v1/prices/quote', 'POST']]) {
+    const res = await w.send(path, { method, body: method === 'POST' ? [] : undefined, key: 'unknown-key-1234' });
+    eq([res.status, await readJson(res)], [401, { error: 'license_invalid' }], path);
+  }
+  w.responders.validate = () => jsonResponse(notFound('License key is revoked'), 404);
+  const res = await w.send('/pricing/v1/prices/quote', { method: 'POST', body: [], key: 'revoked-key-1234' });
+  eq([res.status, await readJson(res)], [402, { error: 'license_inactive', status: 'revoked' }], 'inactive keeps Sourcery\'s 402');
+});
+
+test('app key with a forced none fill policy cannot spend budget whatever it sends', async () => {
+  const w = await createAppWorld({ fillPolicy: 'none' });
+  await w.send('/pricing/v1/prices/quote', { method: 'POST', body: [], key: APP_KEY, instance: null, headers: { 'x-fill-policy': 'default' } });
+  eq(lastUpstream(w, PRICING).headers['x-fill-policy'], 'none');
+});
+
+test('quote batch cap: a policy maxQuoteItems refuses larger batches with 413', async () => {
+  const w = await createAppWorld({ maxQuoteItems: 100 });
+  const item = { productId: 1 };
+  let res = await w.send('/pricing/v1/prices/quote', { method: 'POST', body: Array(100).fill(item), key: APP_KEY, instance: null });
+  eq(res.status, 200);
+  res = await w.send('/pricing/v1/prices/quote', { method: 'POST', body: Array(101).fill(item), key: APP_KEY, instance: null });
+  eq([res.status, await readJson(res)], [413, { error: 'batch_too_large', max: 100 }]);
+  eq(w.calls.filter((c) => c.url.startsWith(PRICING)).length, 1);
+  res = await w.send('/pricing/v1/prices/quote', { method: 'POST', body: { not: 'an array' }, key: APP_KEY, instance: null });
+  eq(res.status, 400);
+});
+
+test('rate-limiting binding: decides per-minute limits when present, keyed per licence key', async () => {
+  const limiter = fakeRateLimiter(2);
+  const w = createWorld({ RATE_LIMIT_LICENSE: limiter, BURST_PER_MINUTE: '1' });
+  eq((await w.send('/v1/license')).status, 200);
+  eq((await w.send('/v1/license')).status, 200, 'the binding, not the in-memory fallback (limit 1), decides');
+  const res = await w.send('/v1/license');
+  eq([res.status, res.headers.get('retry-after'), (await readJson(res)).scope], [429, '60', 'minute']);
+  eq(new Set(limiter.keys).size, 1);
+  ok(!limiter.keys[0].includes(KEY), 'the binding key is a hash, never the licence key');
+});
+
+test('rate-limiting binding: anonymous calls are limited per IP; a binding error fails open', async () => {
+  const limiter = fakeRateLimiter(1);
+  const w = createWorld({ RATE_LIMIT_PUBLIC: limiter });
+  const anon = (ip) => w.send('/v1/health', { key: null, instance: null, headers: { 'cf-connecting-ip': ip } });
+  eq((await anon('1.1.1.1')).status, 200);
+  eq((await anon('1.1.1.1')).status, 429);
+  eq((await anon('2.2.2.2')).status, 200);
+  eq(limiter.keys, ['ip:1.1.1.1', 'ip:1.1.1.1', 'ip:2.2.2.2']);
+  w.env.RATE_LIMIT_PUBLIC = { limit: async () => { throw new Error('down'); } };
+  eq((await anon('1.1.1.1')).status, 200);
+  ok(w.logs.some(([event]) => event === 'rate_limiter_unavailable'));
+});
+
+test('app key quota: daily limit from its policy, counted separately from licences', async () => {
+  const w = await createAppWorld({ quota: { daily: 2, perMinute: null, perMinuteBinding: null } });
+  eq((await w.send('/pricing/v1/history', { key: APP_KEY, instance: null })).status, 200);
+  eq((await w.send('/pricing/v1/history', { key: APP_KEY, instance: null })).status, 200);
+  const res = await w.send('/pricing/v1/history', { key: APP_KEY, instance: null });
+  eq([res.status, (await readJson(res)).scope], [429, 'day']);
+  eq((await w.send('/v1/license')).status, 200, 'the licence quota is untouched');
+});
+
+test('policy table: the shipped table is valid; malformed rows are rejected', async () => {
+  assertValidClients(DEFAULT_CLIENTS);
+  eq(LICENSE_CLIENT.routes.includes('catalog:tags.write'), false, 'no client is granted the tag write by default');
+  const app = { id: 'x', auth: 'app-key', keySha256: '0'.repeat(64), routes: [], fillPolicy: 'none', quota: {}, origins: [] };
+  const bad = [
+    { ...app, routes: ['pricing:nope'] },
+    { ...app, fillPolicy: 'sometimes' },
+    { ...app, fillPolicy: 'by-license-tier' },
+    { ...app, keySha256: 'not-a-hash' },
+    { ...app, routes: ['gateway:license'] },
+    { ...app, id: 'sourcery' },
+  ];
+  for (const row of bad) {
+    let threw = false;
+    try { assertValidClients({ ...DEFAULT_CLIENTS, appKeys: [row] }); } catch { threw = true; }
+    ok(threw, JSON.stringify(row));
+  }
+  let threw = false;
+  try { assertValidClients({ ...DEFAULT_CLIENTS, anonymous: { ...ANONYMOUS_CLIENT, routes: ['pricing:quote'] } }); } catch { threw = true; }
+  ok(threw, 'the anonymous client may not be granted data routes');
 });
 
 // ---------- runner ----------

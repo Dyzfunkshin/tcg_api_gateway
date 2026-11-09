@@ -8,8 +8,13 @@ behaviour, and fold any new owner decision back into it.
 
 ## Layout
 
-- `src/worker.js` — routing, auth, quotas, forwarding (`handle(request, env, deps)`;
-  `deps.fetch/now/log` are injectable for tests).
+- `src/worker.js` — the request pipeline: match route, identify client, check
+  policy, quota, forward (`handle(request, env, deps)`; `deps.fetch/now/log/clients`
+  are injectable for tests).
+- `src/routes.js` — every known path (gateway, pricing, catalog) and the legacy
+  aliases. Mirrors the services' `INTEGRATION.md`.
+- `src/clients.js` — the client policy table (routes, fill policy, quota, origins);
+  validated at import by `assertValidClients`.
 - `src/polar.js` — Polar licence-key API client (contract documented in the file).
 - `src/kv.js` — tiny KV JSON helpers.
 - `test/run.js` — hand-rolled offline tests (`node:assert`, fake KV, mocked fetch).
@@ -30,6 +35,10 @@ npm test        # offline; must stay offline and dependency-free
 - **Every policy rule gets an allow-case and a deny-case test.**
 - **The services' `INTEGRATION.md` files are the route contract.** When pricing
   or catalog changes a route, the allow-list and its tests change together.
+  When the gateway's own HTTP surface changes, update this repo's
+  `INTEGRATION.md`.
+- **Rate-limit bindings in `wrangler.toml` must match the `perMinute` of the
+  policies that name them** (a binding's limit is fixed at deploy).
 - **Never take `x-fill-policy` from a client**; the gateway sets it from policy.
 - **Secrets never appear in code, logs, or output.** Bitwarden (project
   `poke-scans`) is the source of truth; see PLAN.md section 7. Licence keys are

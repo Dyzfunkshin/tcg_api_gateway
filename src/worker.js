@@ -1,15 +1,16 @@
-// TCG API gateway (G0: still behaves exactly like sourcery/gateway at 401b189).
+// TCG API gateway: the single front door to the private pricing and catalog services.
 //
-// Validates a Polar license key, enforces per-key quotas, and forwards
-// allow-listed routes to two private origins (pricing, catalog), injecting each
-// origin's service token. See ../docs/PLAN.md for where this is going and
-// ../docs/sourcery-gateway-README.md for today's routes and env (the Polar
-// contract itself is documented in ./polar.js).
+// Every request runs one pipeline (docs/PLAN.md section 6.1): match the route (404/405
+// before any auth work), identify the client from its credential, check the client's
+// policy allows the route, enforce its quota, then forward to the service with the
+// service's own token and a policy-chosen x-fill-policy. Routes live in ./routes.js,
+// client policies in ./clients.js, the Polar contract in ./polar.js.
 import { getJson, putJson, deleteKey } from './kv.js';
 import * as polar from './polar.js';
+import { matchPath } from './routes.js';
+import { DEFAULT_CLIENTS, isOpenRoute } from './clients.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
-const DEFAULT_CORS_PREFIXES = 'chrome-extension://,moz-extension://';
 const INACTIVE_STATUSES = new Set(['expired', 'revoked', 'disabled']);
 const INACTIVE_DETAIL = /expired|revoked|disabled/i;
 
@@ -55,10 +56,13 @@ function instanceIdFrom(request) {
   return /^[A-Za-z0-9_-]{1,128}$/.test(value) ? value : null;
 }
 
+// Every Origin prefix any client is allowed (CORS is decided before the caller is known:
+// a preflight carries no credential).
+export const corsPrefixesOf = (clients) => [...new Set([clients.anonymous, clients.license, ...clients.appKeys].flatMap((c) => c.origins))];
+
 // CORS headers for an allowed Origin; {} for a missing or disallowed one.
-export function corsHeaders(origin, env) {
+export function corsHeaders(origin, prefixes) {
   if (!origin) return {};
-  const prefixes = toList(env.ALLOWED_ORIGIN_PREFIXES ?? DEFAULT_CORS_PREFIXES);
   if (!prefixes.some((prefix) => origin.startsWith(prefix))) return {};
   return {
     'Access-Control-Allow-Origin': origin,
@@ -210,12 +214,8 @@ async function forgetVerdict(env, cacheKey) {
   await deleteKey(env.LICENSES, cacheKey);
 }
 
-// Resolves { verdict, ... } for an authed request or { response } to return.
-async function authenticate(request, env, deps) {
-  const key = licenseKeyFrom(request);
-  const instanceId = instanceIdFrom(request);
-  if (!key || !instanceId) return { response: errorResponse(401, 'license_required') };
-
+// Resolves { verdict, ... } for a valid licence or { response } to return.
+async function authenticateLicense(key, instanceId, env, deps) {
   const now = deps.now();
   const cacheMs = toInt(env.LICENSE_CACHE_SECONDS, 600) * 1000;
   const graceSeconds = toInt(env.LICENSE_GRACE_SECONDS, 86400);
@@ -305,23 +305,53 @@ async function flushQuota(mem, env, deps) {
     deps.log('quota_store_unavailable', { op: 'put', error: String(error && error.message) });
   }
 }
-async function applyQuota(keyHash, env, deps) {
-  const now = deps.now();
-  const dailyLimit = toInt(env.DAILY_QUOTA, 2000);
-  const burstLimit = toInt(env.BURST_PER_MINUTE, 60);
-  const keys = quotaKeys(keyHash, now);
+// The per-minute verdict from a Workers rate-limiting binding: true (allowed), false
+// (over), or null when the binding is not configured. A binding error fails open: a
+// rate limiter is never the reason a legitimate caller sees nothing.
+async function bindingAllows(env, bindingName, key, deps) {
+  const binding = bindingName ? env[bindingName] : null;
+  if (!binding || typeof binding.limit !== 'function') return null;
+  try {
+    const { success } = await binding.limit({ key });
+    return Boolean(success);
+  } catch (error) {
+    deps.log('rate_limiter_unavailable', { binding: bindingName, error: String(error && error.message) });
+    return true;
+  }
+}
 
-  let mem = quotaMemory.get(keyHash);
+const minuteExceeded = (now, retryAfterSeconds) =>
+  errorResponse(429, 'quota_exceeded', { scope: 'minute' }, { 'Retry-After': String(retryAfterSeconds ?? Math.ceil((Math.floor(now / 60000) * 60000 + 60000 - now) / 1000)) });
+
+// The quota limits for a client: its policy, with the licence client's overridable by
+// DAILY_QUOTA / BURST_PER_MINUTE (the vars sourcery-gateway already used).
+function quotaLimitsFor(client, env) {
+  const { daily, perMinute, perMinuteBinding } = client.quota;
+  if (client.auth !== 'license') return { daily, perMinute, perMinuteBinding };
+  return { daily: toInt(env.DAILY_QUOTA, daily), perMinute: toInt(env.BURST_PER_MINUTE, perMinute), perMinuteBinding };
+}
+
+// Per-minute limits come from the client's rate-limiting binding (PLAN.md 6.1 step 4);
+// without one (local dev, tests) an in-isolate counter stands in. Daily limits are KV
+// counters, buffered in memory. `subject` is what the quota is keyed on: the licence
+// key hash, or "app:<client id>".
+async function applyQuota(subject, limits, env, deps) {
+  const now = deps.now();
+  const dailyLimit = limits.daily;
+  const keys = quotaKeys(subject, now);
+
+  let mem = quotaMemory.get(subject);
   if (mem && mem.dayKey !== keys.day) { await flushQuota(mem, env, deps); mem = null; } // yesterday's tail goes to its own key
   if (!mem) {
     mem = { dayKey: keys.day, base: await readCount(env.LICENSES, keys.day, deps), pending: 0, minuteKey: keys.minute, minuteCount: 0 };
-    quotaMemory.set(keyHash, mem);
+    quotaMemory.set(subject, mem);
   }
-  if (mem.minuteKey !== keys.minute) { mem.minuteKey = keys.minute; mem.minuteCount = 0; }
-  mem.minuteCount += 1;
-  if (mem.minuteCount > burstLimit) {
-    const retryAfter = Math.ceil((Math.floor(now / 60000) * 60000 + 60000 - now) / 1000);
-    return { response: errorResponse(429, 'quota_exceeded', { scope: 'minute' }, { 'Retry-After': String(retryAfter) }) };
+  const allowed = await bindingAllows(env, limits.perMinuteBinding, subject, deps);
+  if (allowed === false) return { response: minuteExceeded(now, 60) };
+  if (allowed === null && limits.perMinute !== null) {
+    if (mem.minuteKey !== keys.minute) { mem.minuteKey = keys.minute; mem.minuteCount = 0; }
+    mem.minuteCount += 1;
+    if (mem.minuteCount > limits.perMinute) return { response: minuteExceeded(now) };
   }
   mem.pending += 1;
   const dayCount = mem.base + mem.pending;
@@ -487,117 +517,134 @@ function licenseRoute(auth) {
   });
 }
 
-async function quoteRoute(request, auth, env, deps) {
-  const config = originConfig(env, 'PRICING');
-  if (!config) return errorResponse(503, 'origin_not_configured');
-  const body = await readBodyText(request);
-  if (body.tooLarge) return errorResponse(413, 'payload_too_large');
-  let parsed = null;
-  try {
-    parsed = JSON.parse(body.text);
-  } catch {
-    parsed = null;
-  }
-  if (!Array.isArray(parsed)) return errorResponse(400, 'invalid_body');
-  return forward(
-    request,
-    config.origin + '/v1/prices/quote',
-    { 'x-app-token': config.token, 'x-fill-policy': fillPolicyFor(auth.verdict.tier, env) },
-    body.text,
-    deps,
-  );
+// The x-fill-policy a client's requests to pricing carry. Never the client's own header.
+function fillPolicyOf(caller, env) {
+  if (caller.client.fillPolicy === 'by-license-tier') return fillPolicyFor(caller.license.verdict.tier, env);
+  return caller.client.fillPolicy;
 }
 
-async function catalogRoute(request, url, env, deps) {
-  const config = originConfig(env, 'CATALOG');
+// The games lists change rarely, so a response without its own cache header is kept an hour.
+const DEFAULT_CACHE_CONTROL = { 'pricing:games': 'private, max-age=3600' };
+
+// Forwards an allowed service route: path verbatim, query string preserved, only the
+// gateway's own headers added (PLAN.md 6.1 steps 6-7).
+async function serviceRoute(request, url, route, upstreamPath, caller, env, deps) {
+  const config = originConfig(env, route.service.toUpperCase());
   if (!config) return errorResponse(503, 'origin_not_configured');
+
   let body;
   if (request.method === 'POST') {
     const read = await readBodyText(request);
     if (read.tooLarge) return errorResponse(413, 'payload_too_large');
     body = read.text;
   }
-  const search = request.method === 'GET' ? url.search : '';
-  return forward(request, config.origin + url.pathname + search, { 'x-app-token': config.token }, body, deps);
-}
+  if (route.id === 'pricing:quote') {
+    let parsed = null;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      parsed = null;
+    }
+    if (!Array.isArray(parsed)) return errorResponse(400, 'invalid_body');
+    const max = caller.client.maxQuoteItems;
+    if (max !== null && parsed.length > max) return errorResponse(413, 'batch_too_large', { max });
+  }
 
-// Each service serves its own games list at /v1/games (owner 2026-11-08); the gateway names
-// them apart. The lists change rarely, so a response without its own cache header is kept an hour.
-const GAMES_ORIGIN = { '/v1/prices/games': 'PRICING', '/v1/catalog/games': 'CATALOG' };
-
-async function gamesRoute(request, url, env, deps) {
-  const config = originConfig(env, GAMES_ORIGIN[url.pathname]);
-  if (!config) return errorResponse(503, 'origin_not_configured');
-  const response = await forward(request, config.origin + '/v1/games', { 'x-app-token': config.token }, undefined, deps);
-  if (response.ok && !response.headers.get('cache-control')) response.headers.set('cache-control', 'private, max-age=3600');
+  const headers = { 'x-app-token': config.token };
+  if (route.service === 'pricing') headers['x-fill-policy'] = fillPolicyOf(caller, env);
+  const response = await forward(request, config.origin + upstreamPath + url.search, headers, body, deps);
+  const fallbackCacheControl = DEFAULT_CACHE_CONTROL[route.id];
+  if (fallbackCacheControl && response.ok && !response.headers.get('cache-control')) response.headers.set('cache-control', fallbackCacheControl);
   return response;
 }
+
+// ---------- callers ----------
+
+// Identifies the caller (PLAN.md 6.1 step 2): { client, license?, subject } or { response }.
+// No Authorization header at all is the anonymous client. Any credential that is present
+// but invalid is refused here and never falls back to anonymous.
+async function identifyCaller(request, env, deps) {
+  const { clients } = deps;
+  const header = (request.headers.get('authorization') || '').trim();
+  if (!header) return { client: clients.anonymous, subject: null };
+  if (!/^Bearer\s/i.test(header)) return { response: errorResponse(401, 'credential_invalid') };
+  const key = licenseKeyFrom(request);
+  if (!key) return { response: errorResponse(401, 'credential_invalid') };
+
+  // 1. App keys first: an exact hash match. A licence key never matches an app-key hash.
+  const keyHash = await sha256Hex(key);
+  const app = clients.appKeys.find((client) => client.keySha256 === keyHash);
+  if (app) return { client: app, subject: 'app:' + app.id };
+
+  // 2. Otherwise a licence, which needs its activation id. 3. Otherwise 401.
+  const instanceId = instanceIdFrom(request);
+  if (!instanceId) return { response: errorResponse(401, 'license_required') };
+  const license = await authenticateLicense(key, instanceId, env, deps);
+  if (license.response) return { response: license.response };
+  return { client: clients.license, license, subject: license.keyHash };
+}
+
+const callerIp = (request) => request.headers.get('cf-connecting-ip') || 'unknown';
 
 // ---------- routing ----------
 
-const PRODUCT_PATH = /^\/v1\/products\/\d+$/;
-
-// Returns { methods, auth, run } for a known path, or null.
-function matchRoute(pathname) {
-  switch (pathname) {
-    case '/v1/health':
-      return { methods: ['GET'], auth: false, name: 'health' };
-    case '/v1/license/activate':
-      return { methods: ['POST'], auth: false, name: 'activate' };
-    case '/v1/license/deactivate':
-      return { methods: ['POST'], auth: true, name: 'deactivate' };
-    case '/v1/license':
-      return { methods: ['GET'], auth: true, name: 'license' };
-    case '/v1/prices/quote':
-      return { methods: ['POST'], auth: true, name: 'quote' };
-    case '/v1/products:lookup':
-      return { methods: ['POST'], auth: true, name: 'catalog' };
-    case '/v1/prices/games':
-    case '/v1/catalog/games':
-      return { methods: ['GET'], auth: true, name: 'games' };
-    default:
-      return PRODUCT_PATH.test(pathname) ? { methods: ['GET'], auth: true, name: 'catalog' } : null;
-  }
-}
-
 async function route(request, env, deps) {
   const url = new URL(request.url);
-  const matched = matchRoute(url.pathname);
+  // 1. Match the route: 404 / 405 before any auth work.
+  const matched = matchPath(url.pathname);
   if (!matched) return errorResponse(404, 'not_found');
-  if (!matched.methods.includes(request.method)) {
-    return errorResponse(405, 'method_not_allowed', {}, { Allow: matched.methods.join(', ') + ', OPTIONS' });
+  const route = matched.routes.find((r) => r.method === request.method);
+  if (!route) {
+    const methods = [...new Set(matched.routes.map((r) => r.method))];
+    return errorResponse(405, 'method_not_allowed', {}, { Allow: methods.join(', ') + ', OPTIONS' });
   }
 
-  if (matched.name === 'health') return health(env);
-  if (matched.name === 'activate') return activateRoute(request, env, deps);
+  // 2. Identify the client.
+  const caller = await identifyCaller(request, env, deps);
+  if (caller.response) return caller.response;
+  const { client } = caller;
+  if (matched.aliasOf) deps.log('legacy_alias', { path: matched.aliasOf, route: route.id, client: client.id });
 
-  const auth = await authenticate(request, env, deps);
-  if (auth.response) return auth.response;
-  const quota = await applyQuota(auth.keyHash, env, deps);
-  if (quota.response) return quota.response;
+  // 3. The client's policy must allow the route. Open routes are allowed to everyone.
+  if (!isOpenRoute(route.id) && !client.routes.includes(route.id)) {
+    if (client.auth === 'none') return errorResponse(401, 'credential_required');
+    deps.log('route_forbidden', { route: route.id, client: client.id });
+    return errorResponse(403, 'forbidden');
+  }
 
+  // 4. Quota.
+  let quota = null;
+  if (client.auth === 'none') {
+    const allowed = await bindingAllows(env, client.quota.perMinuteBinding, 'ip:' + callerIp(request), deps);
+    if (allowed === false) return minuteExceeded(deps.now(), 60);
+  } else {
+    quota = await applyQuota(caller.subject, quotaLimitsFor(client, env), env, deps);
+    if (quota.response) return quota.response;
+  }
+
+  // 5. (Edge cache: G5.) 6-7. Forward or answer.
   let response;
-  switch (matched.name) {
-    case 'deactivate':
-      response = await deactivateRoute(auth, env, deps);
+  switch (route.id) {
+    case 'gateway:health':
+      response = health(env);
       break;
-    case 'license':
-      response = licenseRoute(auth);
+    case 'gateway:license.activate':
+      response = await activateRoute(request, env, deps);
       break;
-    case 'quote':
-      response = await quoteRoute(request, auth, env, deps);
+    case 'gateway:license.deactivate':
+      response = await deactivateRoute(caller.license, env, deps);
       break;
-    case 'games':
-      response = await gamesRoute(request, url, env, deps);
+    case 'gateway:license':
+      response = licenseRoute(caller.license);
       break;
     default:
-      response = await catalogRoute(request, url, env, deps);
+      response = await serviceRoute(request, url, route, matched.upstreamPath, caller, env, deps);
   }
-  response.headers.set('X-Quota-Remaining', String(quota.remaining));
+  if (quota) response.headers.set('X-Quota-Remaining', String(quota.remaining));
   return response;
 }
 
-// deps: { fetch, now, log } are injectable for tests.
+// deps: { fetch, now, log, clients } are injectable for tests.
 export async function handle(request, env, deps = {}) {
   const resolved = {
     // The runtime fetch must not be called as a method of this object (Workers throws
@@ -605,8 +652,9 @@ export async function handle(request, env, deps = {}) {
     fetch: deps.fetch || ((url, init) => fetch(url, init)),
     now: deps.now || Date.now,
     log: deps.log || ((event, fields) => console.log(JSON.stringify({ event, ...fields }))),
+    clients: deps.clients || DEFAULT_CLIENTS,
   };
-  const cors = corsHeaders(request.headers.get('origin'), env);
+  const cors = corsHeaders(request.headers.get('origin'), corsPrefixesOf(resolved.clients));
 
   let response;
   if (request.method === 'OPTIONS') {

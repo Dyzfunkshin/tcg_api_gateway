@@ -28,4 +28,25 @@ DAILY_QUOTA = "20000"           # requests per key per UTC day; a 500-page selle
 BURST_PER_MINUTE = "300"        # requests per key per minute; a scan turns a page every 0.5-3 s with 1-3 requests each plus no-price retries
 LICENSE_CACHE_SECONDS = "600"   # how long a validate verdict is cached
 LICENSE_GRACE_SECONDS = "86400" # how long a cached valid verdict is reused when Polar is unreachable
-ALLOWED_ORIGIN_PREFIXES = "chrome-extension://,moz-extension://"
+# CORS origins are per client in src/clients.js (ALLOWED_ORIGIN_PREFIXES is no longer read).
+# BURST_PER_MINUTE now only drives the in-memory fallback used when RATE_LIMIT_LICENSE is
+# absent (local dev); in production the binding below decides, so keep the two equal.
+
+# Workers rate-limiting bindings (PLAN.md 6.1 step 4): every per-minute and per-IP limit.
+# A binding's limit is fixed here, so each must match the perMinute of the policy that
+# names it in src/clients.js. namespace_id is any account-unique integer string.
+# Syntax not yet checked against a real `wrangler deploy` (no deploys until G0 is cleared).
+[[ratelimits]]
+name = "RATE_LIMIT_LICENSE"   # Sourcery licence keys, keyed by key hash
+namespace_id = "1001"
+simple = { limit = 300, period = 60 }
+
+[[ratelimits]]
+name = "RATE_LIMIT_PUBLIC"    # anonymous callers, keyed by IP
+namespace_id = "1002"
+simple = { limit = 60, period = 60 }
+
+[[ratelimits]]
+name = "RATE_LIMIT_APP"       # server-side app keys, keyed by client id
+namespace_id = "1003"
+simple = { limit = 600, period = 60 }
