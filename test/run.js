@@ -317,15 +317,14 @@ test('organization mismatch and empty POLAR_ORGANIZATION_ID are 401 license_inva
   eq(w.polarCalls('validate').length, 0, 'no key is sent to Polar without an organization id');
 });
 
-test('validate 404 plain is 401 license_invalid and the verdict is cached for LICENSE_CACHE_SECONDS', async () => {
+test('validate 404 plain is 401 license_invalid and the verdict is cached in memory (never KV) for LICENSE_CACHE_SECONDS', async () => {
   const w = createWorld();
   w.responders.validate = () => jsonResponse(notFound('License key not found'), 404);
   const res = await w.send('/v1/license');
   eq(res.status, 401);
   eq(await readJson(res), { error: 'license_invalid' });
-  const cacheKeys = [...w.kv.store.keys()].filter((k) => k.startsWith('lic:'));
-  eq(cacheKeys.length, 1);
-  eq(w.kv.ttls.get(cacheKeys[0]), 600);
+  // changed with the licence flood guard: this used to assert a KV write (ttl 600) for the 404 verdict
+  eq([...w.kv.store.keys()].filter((k) => k.startsWith('lic:')).length, 0);
   eq((await w.send('/v1/license')).status, 401);
   eq(w.polarCalls('validate').length, 1, 'the invalid verdict is served from the cache');
   w.clock.t += 601 * 1000;
@@ -369,6 +368,90 @@ test('the 404 detail is logged with the key-hash prefix only', async () => {
   ok(entry, 'a license_not_found event is logged');
   eq(entry[1].detail, 'License key not found');
   eq(entry[1].key.length, 8);
+});
+
+// Licence flood guard: per-IP RATE_LIMIT_LICENSE_ATTEMPTS before any KV read or Polar call.
+function countKvOps(w) {
+  const ops = { gets: 0, puts: 0 };
+  const { get, put } = w.kv;
+  w.kv.get = async (...args) => { ops.gets += 1; return get(...args); };
+  w.kv.put = async (...args) => { ops.puts += 1; return put(...args); };
+  return ops;
+}
+const ATTEMPT_IP = { 'cf-connecting-ip': '9.9.9.9' };
+
+test('licence flood guard: within the limit the request proceeds, keyed by ip', async () => {
+  const limiter = fakeRateLimiter(2);
+  const w = createWorld({ RATE_LIMIT_LICENSE_ATTEMPTS: limiter });
+  eq((await w.send('/v1/license', { headers: ATTEMPT_IP })).status, 200);
+  eq(w.polarCalls('validate').length, 1);
+  eq(limiter.keys, ['ip:9.9.9.9']);
+});
+
+test('licence flood guard: over the limit is 429 license_attempts_exceeded with no Polar call and no KV access', async () => {
+  const limiter = fakeRateLimiter(0);
+  const w = createWorld({ RATE_LIMIT_LICENSE_ATTEMPTS: limiter });
+  const ops = countKvOps(w);
+  const res = await w.send('/v1/license', { key: 'random-key-1', headers: ATTEMPT_IP });
+  eq([res.status, res.headers.get('retry-after'), await readJson(res)], [429, '60', { error: 'license_attempts_exceeded' }]);
+  eq(w.calls.length, 0);
+  eq([ops.gets, ops.puts], [0, 0]);
+  const entry = w.logs.find(([event]) => event === 'license_attempts_limited');
+  ok(entry, 'the limit is logged');
+  eq(entry[1].key.length, 8);
+  ok(!JSON.stringify(w.logs).includes('random-key-1'), 'the raw key is never logged');
+});
+
+test('licence flood guard: a verdict held in memory does not spend an attempt', async () => {
+  const limiter = fakeRateLimiter(1);
+  const w = createWorld({ RATE_LIMIT_LICENSE_ATTEMPTS: limiter });
+  eq((await w.send('/v1/license')).status, 200);
+  eq((await w.send('/v1/license')).status, 200);
+  eq((await w.send('/v1/license')).status, 200);
+  eq(limiter.keys.length, 1, 'only the first, uncached lookup consulted the binding');
+  w.clock.t += 601 * 1000;
+  eq((await w.send('/v1/license')).status, 429, 'an expired verdict needs an attempt again, and the budget is spent');
+});
+
+test('licence flood guard: a Polar 404 key causes zero KV puts, a valid key is still put to KV', async () => {
+  let w = createWorld();
+  let ops = countKvOps(w);
+  w.responders.validate = () => jsonResponse(notFound('License key not found'), 404);
+  eq((await w.send('/v1/license', { key: 'random-key-2' })).status, 401);
+  eq(ops.puts, 0);
+  w = createWorld();
+  ops = countKvOps(w);
+  eq((await w.send('/v1/license')).status, 200);
+  ok([...w.kv.store.keys()].some((k) => k.startsWith('lic:')), 'valid verdict is in KV');
+});
+
+test('licence flood guard: binding absent is allowed; a binding error fails open and is logged', async () => {
+  let w = createWorld();
+  eq((await w.send('/v1/license')).status, 200);
+  w = createWorld({ RATE_LIMIT_LICENSE_ATTEMPTS: { limit: async () => { throw new Error('down'); } } });
+  eq((await w.send('/v1/license')).status, 200);
+  ok(w.logs.some(([event, fields]) => event === 'rate_limiter_unavailable' && fields.binding === 'RATE_LIMIT_LICENSE_ATTEMPTS'));
+});
+
+test('licence flood guard: activate is guarded (allow and deny)', async () => {
+  let w = createWorld({ RATE_LIMIT_LICENSE_ATTEMPTS: fakeRateLimiter(1) });
+  const post = () => w.send('/v1/license/activate', { method: 'POST', key: null, instance: null, body: { licenseKey: KEY, instanceName: 'laptop' }, headers: ATTEMPT_IP });
+  eq((await post()).status, 200);
+  eq(w.polarCalls('activate').length, 1);
+  const res = await post();
+  eq([res.status, res.headers.get('retry-after'), await readJson(res)], [429, '60', { error: 'license_attempts_exceeded' }]);
+  eq(w.polarCalls('activate').length, 1, 'no second Polar call');
+});
+
+test('licence flood guard: deactivate is guarded (allow and deny)', async () => {
+  const limiter = fakeRateLimiter(1);
+  const w = createWorld({ RATE_LIMIT_LICENSE_ATTEMPTS: limiter });
+  eq((await w.send('/v1/license/deactivate', { method: 'POST', headers: ATTEMPT_IP })).status, 200);
+  eq(w.polarCalls('deactivate').length, 1);
+  // the deactivate cleared the verdict, so the next lookup needs an attempt, and the budget is spent
+  const res = await w.send('/v1/license/deactivate', { method: 'POST', headers: ATTEMPT_IP });
+  eq([res.status, await readJson(res)], [429, { error: 'license_attempts_exceeded' }]);
+  eq(w.polarCalls('deactivate').length, 1);
 });
 
 test('benefit filter: listed benefit allowed, unlisted rejected', async () => {

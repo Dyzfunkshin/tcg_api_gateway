@@ -131,6 +131,7 @@ All errors are JSON `{error, ...}`.
 | 409 | `activation_limit` | licence activation limit reached |
 | 413 | `payload_too_large` / `batch_too_large` | body over 1 MB / quote batch over your policy's `max` |
 | 429 | `quota_exceeded` | `scope` `minute` or `day`; honour `Retry-After` |
+| 429 | `license_attempts_exceeded` | too many licence checks (validate, activate, deactivate) from one IP in a minute; sent with `Retry-After: 60` |
 | 502 | `origin_unavailable` | the service failed or is unreachable |
 | 503 | `origin_not_configured` / `license_service_unavailable` | gateway misconfigured / Polar down (with `Retry-After`) |
 

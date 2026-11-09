@@ -189,7 +189,23 @@ const unavailableResponse = (result) =>
 // writes for a day, nothing was cached, every request went to Polar, Polar's rate limit
 // turned every answer into a 503 and the extension read "API unreachable". Memory serves the
 // cache window on its own; KV only lets other isolates skip their first Polar call.
-const verdictMemory = new Map(); // cacheKey -> verdict
+const verdictMemory = new Map(); // cacheKey -> verdict, bounded (oldest evicted first)
+const VERDICT_MEMORY_MAX_ENTRIES = 1000;
+function memoryRememberVerdict(cacheKey, verdict) {
+  verdictMemory.delete(cacheKey); // re-insert so the entry counts as newest
+  verdictMemory.set(cacheKey, verdict);
+  while (verdictMemory.size > VERDICT_MEMORY_MAX_ENTRIES) verdictMemory.delete(verdictMemory.keys().next().value);
+}
+
+// Per-IP cap on licence checks that could reach Polar or KV (a flood of random keys).
+// Returns a 429 response when over the limit, else null. Binding absent = allowed;
+// a binding error fails open (bindingAllows logs it).
+async function licenseAttemptBlocked(ip, logTag, env, deps) {
+  const allowed = await bindingAllows(env, 'RATE_LIMIT_LICENSE_ATTEMPTS', 'ip:' + ip, deps);
+  if (allowed !== false) return null;
+  deps.log('license_attempts_limited', { ip, key: logTag });
+  return errorResponse(429, 'license_attempts_exceeded', {}, { 'Retry-After': '60' });
+}
 // Second layer (2026-11-07): the colo's edge cache (Cache API), which has no daily write limit,
 // so a fresh isolate in the same colo finds the verdict without a Polar call even while KV
 // refuses writes. Keyed by a synthetic URL; absent in node (tests) and on error.
@@ -203,11 +219,11 @@ async function cachedVerdict(env, cacheKey) {
   if (cache) {
     try {
       const hit = await cache.match(VERDICT_CACHE_URL + cacheKey);
-      if (hit) { const verdict = await hit.json(); verdictMemory.set(cacheKey, verdict); return verdict; }
+      if (hit) { const verdict = await hit.json(); memoryRememberVerdict(cacheKey, verdict); return verdict; }
     } catch (error) { /* fall through to KV */ }
   }
   const stored = await getJson(env.LICENSES, cacheKey);
-  if (stored) verdictMemory.set(cacheKey, stored);
+  if (stored) memoryRememberVerdict(cacheKey, stored);
   return stored;
 }
 async function forgetVerdict(env, cacheKey) {
@@ -218,7 +234,7 @@ async function forgetVerdict(env, cacheKey) {
 }
 
 // Resolves { verdict, ... } for a valid licence or { response } to return.
-async function authenticateLicense(key, instanceId, env, deps) {
+async function authenticateLicense(key, instanceId, ip, env, deps) {
   const now = deps.now();
   const cacheMs = toInt(env.LICENSE_CACHE_SECONDS, 600) * 1000;
   const graceSeconds = toInt(env.LICENSE_GRACE_SECONDS, 86400);
@@ -230,6 +246,14 @@ async function authenticateLicense(key, instanceId, env, deps) {
   if (!env.POLAR_ORGANIZATION_ID) {
     deps.log('license_rejected', { key: logTag, reason: 'POLAR_ORGANIZATION_ID is not configured; rejecting every key' });
     return { response: errorResponse(401, 'license_invalid') };
+  }
+
+  // A verdict still fresh in this isolate's memory costs nothing. Anything else may reach the
+  // edge cache, KV and Polar, so it spends one per-IP attempt first (flood guard).
+  const inMemory = verdictMemory.get(cacheKey);
+  if (!(inMemory && now - inMemory.checkedAt < cacheMs)) {
+    const blocked = await licenseAttemptBlocked(ip, logTag, env, deps);
+    if (blocked) return { response: blocked };
   }
 
   const cached = await cachedVerdict(env, cacheKey);
@@ -257,7 +281,8 @@ async function authenticateLicense(key, instanceId, env, deps) {
       const detail = String(result.body.detail ?? '');
       deps.log('license_not_found', { key: logTag, detail });
       verdict = invalidVerdict(inactiveWordIn(detail), now);
-      await rememberVerdict(env, cacheKey, verdict, cacheMs / 1000, deps);
+      // Not-found verdicts stay in isolate memory only: a random key must never cost a KV write.
+      memoryRememberVerdict(cacheKey, verdict);
     } else {
       // 400 / 422: Polar rejected the request itself. Not an outage and not worth caching.
       deps.log('license_rejected', { key: logTag, reason: 'Polar answered ' + result.status });
@@ -369,7 +394,7 @@ async function applyQuota(subject, limits, env, deps) {
 // A license verdict is cached to spare Polar, not to decide anything: a failed write is logged
 // and the request carries on with the verdict it already has.
 async function rememberVerdict(env, cacheKey, verdict, ttlSeconds, deps) {
-  verdictMemory.set(cacheKey, verdict);
+  memoryRememberVerdict(cacheKey, verdict);
   const cache = edgeCache();
   if (cache) {
     try {
@@ -464,6 +489,8 @@ async function activateRoute(request, env, deps) {
     deps.log('license_activate_rejected', { key: logTag, reason: 'POLAR_ORGANIZATION_ID is not configured; rejecting every key' });
     return errorResponse(401, 'license_invalid');
   }
+  const blocked = await licenseAttemptBlocked(callerIp(request), logTag, env, deps);
+  if (blocked) return blocked;
   let result = null;
   try {
     result = await polar.activate(licenseKey, instanceName, env, deps.fetch);
@@ -724,7 +751,7 @@ async function identifyCaller(request, env, deps) {
   // 2. Otherwise a licence, which needs its activation id. 3. Otherwise 401.
   const instanceId = instanceIdFrom(request);
   if (!instanceId) return { response: errorResponse(401, 'license_required') };
-  const license = await authenticateLicense(key, instanceId, env, deps);
+  const license = await authenticateLicense(key, instanceId, callerIp(request), env, deps);
   if (license.response) return { response: license.response };
   return { client: clients.license, license, subject: license.keyHash };
 }
