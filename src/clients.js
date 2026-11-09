@@ -92,8 +92,10 @@ export const PUBLIC_SESSION_CLIENTS = Object.freeze([
     fillPolicy: 'none',
     quota: Object.freeze({ daily: null, perMinute: 300, perMinuteBinding: 'RATE_LIMIT_SESSION' }),
     maxQuoteItems: 100,
-    // the Turnstile widget on the site must be rendered with this action; a token minted by
-    // any other widget on the same hostname is refused (siteverify echoes the action back)
+    // the Turnstile widget on the site must be rendered with this action (a public label,
+    // echoed back by siteverify). Other widgets' tokens already fail siteverify (each widget
+    // has its own secret); this only stops our own widget, reused elsewhere on the site, from
+    // buying a session.
     turnstileAction: 'gateway-session',
     // production (GitHub Pages, CNAME poke-guide.com) and the preview build
     // (GitHub Pages of <owner>/poke-guide-preview, served from the owner's github.io origin)

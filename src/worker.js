@@ -729,7 +729,7 @@ async function sessionRoute(request, env, deps) {
     deps.log('session_refused', { client: client.id, reason: 'hostname', hostname: verdict.hostname, ip: callerIp(request) });
     return errorResponse(403, 'turnstile_failed');
   }
-  // a token from a different widget on the same hostname must not buy a session
+  // a token from our widget used for another purpose on the site must not buy a session
   if (verdict.action !== client.turnstileAction) {
     deps.log('session_refused', { client: client.id, reason: 'action mismatch', action: verdict.action, ip: callerIp(request) });
     return errorResponse(403, 'turnstile_failed');

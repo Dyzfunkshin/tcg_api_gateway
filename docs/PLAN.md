@@ -483,5 +483,10 @@ sections above):
     `turnstileAction`; poke-guide's is `gateway-session`. `/v1/session`
     refuses a token whose siteverify `action` differs, with
     `403 turnstile_failed`, the same code as any other Turnstile failure.
-    This stops a token from another widget on the same hostname buying a
-    session. poke_guide was notified through the huddle's notices.
+    The action is a public label, not a secret. Tokens from other widgets
+    are already rejected by siteverify, because each widget has its own
+    secret key. This check only separates uses of **our own** widget: if the
+    same widget is later reused on the site for something else (a contact
+    form, say), that token cannot buy a session. poke-guide uses the widget
+    only for sessions today, so this is cheap insurance for later, not a
+    current defence. poke_guide was notified through the huddle's notices.
