@@ -12,6 +12,10 @@ workers_dev = true
 binding = "LICENSES"
 id = "3216419ee1244988a05fc0bad9d7b17c"
 
+# Workers Logs: keeps the structured security events (docs/PLAN.md section 7.2) queryable in the dashboard.
+[observability]
+enabled = true
+
 # Non-secret configuration. Secrets are NOT listed here; set each with
 #   npx wrangler secret put <NAME>
 # Secrets: PRICING_APP_TOKEN, CATALOG_APP_TOKEN, and from G4 ACCESS_CLIENT_ID +
@@ -43,6 +47,13 @@ SESSION_TTL_SECONDS = "1800"    # lifetime of a public session token (PLAN.md 6.
 name = "RATE_LIMIT_LICENSE"   # Sourcery licence keys, keyed by key hash
 namespace_id = "1001"
 simple = { limit = 300, period = 60 }
+
+# Flood guard: caps licence checks per IP that could reach Polar or KV (random-key floods).
+# Keyed by IP; verdicts already in isolate memory do not spend an attempt.
+[[ratelimits]]
+name = "RATE_LIMIT_LICENSE_ATTEMPTS"
+namespace_id = "1005"
+simple = { limit = 20, period = 60 }
 
 [[ratelimits]]
 name = "RATE_LIMIT_PUBLIC"    # anonymous callers, keyed by IP

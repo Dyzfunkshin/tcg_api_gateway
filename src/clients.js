@@ -92,6 +92,9 @@ export const PUBLIC_SESSION_CLIENTS = Object.freeze([
     fillPolicy: 'none',
     quota: Object.freeze({ daily: null, perMinute: 300, perMinuteBinding: 'RATE_LIMIT_SESSION' }),
     maxQuoteItems: 100,
+    // the Turnstile widget on the site must be rendered with this action; a token minted by
+    // any other widget on the same hostname is refused (siteverify echoes the action back)
+    turnstileAction: 'gateway-session',
     // production (GitHub Pages, CNAME poke-guide.com) and the preview build
     // (GitHub Pages of <owner>/poke-guide-preview, served from the owner's github.io origin)
     origins: Object.freeze(['https://poke-guide.com', 'https://dyzfunkshin.github.io']),
@@ -144,6 +147,9 @@ export function assertValidClients({ anonymous, license, appKeys, publicSessions
     if (client.routes.includes('catalog:tags.write')) throw new Error(`client ${client.id}: public clients may not write`);
     if (!Number.isInteger(client.maxQuoteItems) || client.maxQuoteItems < 1) throw new Error(`client ${client.id}: public clients need a quote batch cap`);
     if (!client.quota.perMinuteBinding) throw new Error(`client ${client.id}: public clients need a per-IP rate-limit binding`);
+    if (typeof client.turnstileAction !== 'string' || !/^[A-Za-z0-9_-]{1,32}$/.test(client.turnstileAction)) {
+      throw new Error(`client ${client.id}: public clients need a turnstileAction of 1-32 chars [A-Za-z0-9_-]`);
+    }
     for (const origin of client.origins) {
       if (!/^https:\/\/[a-z0-9.-]+(:\d+)?$/.test(origin)) throw new Error(`client ${client.id}: origin ${origin} must be an exact https origin`);
     }

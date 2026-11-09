@@ -71,7 +71,9 @@ A public site cannot keep a secret, so it proves a Cloudflare Turnstile challeng
 instead and gets a short-lived, read-only session:
 
 1. Embed an invisible Turnstile widget (the **site key** is public; it lives in the
-   site's code). When it yields a widget token, call
+   site's code), rendered with the action `gateway-session` (`data-action="gateway-session"`
+   or the `action` render option); a token from a widget without that action is
+   refused with `403 turnstile_failed`. When it yields a widget token, call
    `POST /v1/session` with body `{"turnstileToken": "<widget token>"}` and
    **no `Authorization` header**. Its `Origin` must be exactly one of the client's
    origins (`https://poke-guide.com`, preview `https://dyzfunkshin.github.io`).
@@ -92,7 +94,8 @@ Quote batches are cached item by item, so a repeat card is answered from the edg
 and only new items reach pricing.
 
 Session errors: `403 origin_not_allowed` (Origin not allowed), `403
-turnstile_failed` (challenge not solved, or solved on another site), `503
+turnstile_failed` (challenge not solved, solved on another site, or the widget lacks the
+`gateway-session` action), `503
 turnstile_unavailable` (retry after `Retry-After`), `503 session_not_configured`,
 `401 session_invalid` (bad, foreign or wrong-origin token), `401
 session_expired`.
@@ -131,6 +134,7 @@ All errors are JSON `{error, ...}`.
 | 409 | `activation_limit` | licence activation limit reached |
 | 413 | `payload_too_large` / `batch_too_large` | body over 1 MB / quote batch over your policy's `max` |
 | 429 | `quota_exceeded` | `scope` `minute` or `day`; honour `Retry-After` |
+| 429 | `license_attempts_exceeded` | too many licence checks (validate, activate, deactivate) from one IP in a minute; sent with `Retry-After: 60` |
 | 502 | `origin_unavailable` | the service failed or is unreachable |
 | 503 | `origin_not_configured` / `license_service_unavailable` | gateway misconfigured / Polar down (with `Retry-After`) |
 

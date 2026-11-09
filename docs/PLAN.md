@@ -311,6 +311,49 @@ Cloudflare account `722b682d1c0bb958ea4d14b5bc6275d1`; KV namespace
 `LICENSES` (`3216419ee1244988a05fc0bad9d7b17c`) carries over so cached
 Sourcery verdicts survive the cut-over.
 
+### 7.1 Rotating `SESSION_SIGNING_KEY`
+
+Session tokens carry no key id (section 6.3), so rotating the key invalidates
+every live session at once. That is acceptable: tokens last 30 minutes
+(`SESSION_TTL_SECONDS`) and clients re-issue on a 401.
+
+- **When:** a suspected leak, or a machine or person with access to the key
+  changes.
+- **How:** generate a new random value of at least 32 bytes inside the tooling
+  so it is never displayed. Store it in Bitwarden project `api-gateway` as
+  `TCG_GATEWAY_SESSION_SIGNING_KEY`, replacing the old value. Then push it as
+  the Worker secret `SESSION_SIGNING_KEY` with `tools/push_secrets.py`, as
+  owner via `owner-ops` (as above).
+- **Expected effect:** each active visitor gets one 401 and silently re-issues
+  a session.
+
+### 7.2 Security log events
+
+Every security-relevant deny decision emits exactly one structured event
+through `deps.log(event, fields)` (`console.log` of JSON in production, kept by
+Workers Logs: `[observability]` in `wrangler.toml`). Event names are stable;
+log queries depend on them, so never rename one. No event ever carries a
+session token, Turnstile token, raw licence or app key, Authorization header,
+or secret: licence keys appear only as the 8-character hash prefix (`key`, or
+`subject` with `subjectKind: license`), app keys only as the app id. `ip` is
+`cf-connecting-ip`.
+
+| Event | Fires when | Fields |
+|---|---|---|
+| `credential_invalid` | 401 for an unusable credential: unsupported scheme, malformed bearer value, Bearer licence without a valid `X-Instance-Id` (`license_required`), or an anonymous call to a protected route (`credential_required`) | `reason`, `ip`; `key` (hash prefix) for the instance case; `client`, `route` for `credential_required` |
+| `license_rejected` / `license_not_found` / `license_service_unavailable` / `license_attempts_limited` | licence verdict refused, unknown, Polar unreachable, or per-IP attempt cap hit | `key` (hash prefix), `reason`/`detail`/`status`, `ip` |
+| `session_refused` | `POST /v1/session` refused: `origin_not_allowed`, `bad body`, `turnstile`, `hostname`, `action mismatch` | `reason`, `client` (except origin_not_allowed), `ip`, plus `origin` / `errorCodes` / `hostname` / `action` as relevant |
+| `session_invalid` | session token bad signature, unknown client, origin mismatch, or signing key unset | `reason`, `ip` |
+| `session_expired` | a correctly signed session token past its expiry | `client`, `ip` |
+| `route_forbidden` | 403, the client's policy does not allow the route | `route`, `client` |
+| `rate_limited` | per-minute refusal, from a rate-limit binding or the in-memory counter | `client`, `route`, `limiter` (binding name or `memory`), `subjectKind` (`ip`, `app`, `license`), `subject` (ip, app id, or hash prefix), `ip` |
+| `quota_exceeded` | daily quota refusal | `client`, `route`, `subjectKind`, `subject`, `ip` |
+| `request_rejected` | 413: `reason` is `payload_too_large` or `batch_too_large` | `reason`, `route`, `client`, `ip`; `count`, `max` for batches |
+| `rate_limiter_unavailable`, `access_misconfigured`, `session_not_configured` | operational failures (fail open / 503) | `binding` or `reason`/`missing`, `error` |
+
+Alerting on these events is a separate, deploy-gated task (#9); this section
+only fixes the names and fields it will key on.
+
 ## 8. Migration plan (in order; each step is shippable on its own)
 
 | # | Step | Repo(s) | Done when |
@@ -318,8 +361,8 @@ Sourcery verdicts survive the cut-over.
 | G0 | Bootstrap: copy `sourcery/gateway` (src, tests, wrangler) here with a provenance note; deploy as `tcg-api-gateway` on `*.workers.dev` only; same behaviour as today. | gateway | Test suite green; the `workers.dev` URL answers `/v1/health`. |
 | G1 | Namespaced routing `/pricing/v1/*`, `/catalog/v1/*`; client/policy table; legacy aliases mapped. | gateway | Tests cover allow, deny, alias, header stripping, and forced fill policy. |
 | G2 | `GET /pricing/v1/health` open through the gateway; pricing's freshness alert repointed to it. | gateway, pricing | Alert workflow green against the gateway URL. |
-| G3 | Cut `api.dyzzyscards.com` over from `sourcery-gateway` to `tcg-api-gateway`; push secrets. The custom-domain detach (old Worker) and reattach (new Worker) run as **one scripted step**; a gap of seconds to a minute is acceptable (Sourcery is the only live client and retries). **Stop at that step for the owner's go-ahead.** | gateway | Sourcery's deployed e2e passes 8/8 through the new Worker (`F:/claude_temp/poke-scans/sourcery-e2e-deployed.py`). |
-| G4 | Lock origins with Access (section 4). | gateway (+ Cloudflare) | Direct origin curl is denied; e2e still 8/8; freshness alert still green. |
+| G3 | Cut `api.dyzzyscards.com` over from `sourcery-gateway` to `tcg-api-gateway`; push secrets. The custom-domain detach (old Worker) and reattach (new Worker) run as **one scripted step**; a gap of seconds to a minute is acceptable (Sourcery is the only live client and retries). The script ends by preparing G4: it creates the Access app and service token and pushes `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET` as Worker secrets. **Build gate:** `POLAR_API_BASE` points at Polar production, not sandbox, before cut-over (sandbox licences can be obtained with test card numbers). **Stop at that step for the owner's go-ahead.** | gateway | Sourcery's deployed e2e passes 8/8 through the new Worker (`F:/claude_temp/poke-scans/sourcery-e2e-deployed.py`). |
+| G4 | **Immediately after G3**, with no other step or work between them. Lock origins with Access (section 4). Until this lands, `pricing-origin.dyzzyscards.com` and `catalog-origin.dyzzyscards.com` are directly reachable and bypass every gateway check. The lock waits for the owner's go-ahead; the Access prep above has already run. | gateway (+ Cloudflare) | Direct origin curl is denied; e2e still 8/8; freshness alert still green. |
 | G5 | Public sessions: Turnstile, per-IP limits, edge cache, per-item quote cache. | gateway | Tests; a load test shows cached hits never reaching the origin. |
 | G6 | poke-guide switches from R2 snapshots to the gateway (huddle with `_apps/poke_guide`). | poke_guide, gateway | poke-guide.com search and prices work with R2 unused. |
 | G7 | Sourcery extension moves to the new paths; aliases removed once their hit counts reach zero; `sourcery/gateway` retired. | sourcery, gateway | No alias hits for 30 days. |
@@ -380,6 +423,17 @@ sections above):
 8. Housekeeping: this repo gets `CLAUDE.md` and `INTEGRATION.md`, and is
    listed in `_services/CLAUDE.md`. Git: a branch per step, committed at the
    end of each step, never merged to `main`; step branches merge into `dev`.
+14. G4 follows G3 immediately, with no other step or work between them. The
+    G3 cut-over script ends by preparing G4: it creates the Access app and
+    service token and pushes `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET` as
+    Worker secrets, so the lock is one owner go-ahead away. The owner's
+    go-ahead is still required before the lock itself (section 8). G3 gains a
+    build gate: `POLAR_API_BASE` must point at Polar production, not sandbox,
+    before cut-over, because sandbox licences can be obtained with test card
+    numbers (owner tracks this in their own task).
+15. Rotating `SESSION_SIGNING_KEY` invalidates all live sessions; accepted,
+    because tokens last 30 minutes and clients re-issue on 401. Documented as
+    a runbook (section 7.1), not built as key ids.
 
 **2026-11-09, implementation choices made while building** (owner may revise):
 
@@ -403,3 +457,31 @@ sections above):
     (enforced by `assertValidClients`). Quote items are cached only when they
     carry nothing but `game`, exactly one of `productId`/`skuId`, `condition`,
     `printing`; absent selectors are not defaulted in the key.
+
+**2026-11-09, security logging (task #5):**
+
+16. Every deny decision logs exactly one stable-named event, and no event may
+    contain a secret or raw credential (section 7.2). Existing event names are
+    unchanged; new ones are `credential_invalid`, `rate_limited`,
+    `quota_exceeded`, `session_expired` and `request_rejected`, plus `reason`
+    fields on the previously silent `/v1/session` refusals. Workers Logs is
+    enabled in `wrangler.toml`. Alerting is deferred to task #9.
+
+**2026-11-09, security hardening (owner decisions, tasks #3 and #6):**
+
+17. **Licence flood guard.** A licence lookup that may reach the edge cache,
+    KV or Polar first spends one attempt from `RATE_LIMIT_LICENSE_ATTEMPTS`,
+    keyed by IP, at **20 per IP per minute** (owner's choice). A verdict still
+    fresh in isolate memory is free, so a real Sourcery user spends about one
+    attempt per 10 minutes. Over the limit, the answer is
+    `429 license_attempts_exceeded` with `Retry-After: 60`. The same guard
+    covers `/v1/license/activate` and `/v1/license/deactivate`. Polar
+    "not found" verdicts live in isolate memory only, so a random key never
+    costs a KV write. The verdict memory is capped at 1000 entries. As with
+    every other binding, the guard fails open if the limiter errors.
+18. **Turnstile action.** Every public-session client names a
+    `turnstileAction`; poke-guide's is `gateway-session`. `/v1/session`
+    refuses a token whose siteverify `action` differs, with
+    `403 turnstile_failed`, the same code as any other Turnstile failure.
+    This stops a token from another widget on the same hostname buying a
+    session. poke_guide was notified through the huddle's notices.

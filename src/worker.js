@@ -189,7 +189,23 @@ const unavailableResponse = (result) =>
 // writes for a day, nothing was cached, every request went to Polar, Polar's rate limit
 // turned every answer into a 503 and the extension read "API unreachable". Memory serves the
 // cache window on its own; KV only lets other isolates skip their first Polar call.
-const verdictMemory = new Map(); // cacheKey -> verdict
+const verdictMemory = new Map(); // cacheKey -> verdict, bounded (oldest evicted first)
+const VERDICT_MEMORY_MAX_ENTRIES = 1000;
+function memoryRememberVerdict(cacheKey, verdict) {
+  verdictMemory.delete(cacheKey); // re-insert so the entry counts as newest
+  verdictMemory.set(cacheKey, verdict);
+  while (verdictMemory.size > VERDICT_MEMORY_MAX_ENTRIES) verdictMemory.delete(verdictMemory.keys().next().value);
+}
+
+// Per-IP cap on licence checks that could reach Polar or KV (a flood of random keys).
+// Returns a 429 response when over the limit, else null. Binding absent = allowed;
+// a binding error fails open (bindingAllows logs it).
+async function licenseAttemptBlocked(ip, logTag, env, deps) {
+  const allowed = await bindingAllows(env, 'RATE_LIMIT_LICENSE_ATTEMPTS', 'ip:' + ip, deps);
+  if (allowed !== false) return null;
+  deps.log('license_attempts_limited', { ip, key: logTag });
+  return errorResponse(429, 'license_attempts_exceeded', {}, { 'Retry-After': '60' });
+}
 // Second layer (2026-11-07): the colo's edge cache (Cache API), which has no daily write limit,
 // so a fresh isolate in the same colo finds the verdict without a Polar call even while KV
 // refuses writes. Keyed by a synthetic URL; absent in node (tests) and on error.
@@ -203,11 +219,11 @@ async function cachedVerdict(env, cacheKey) {
   if (cache) {
     try {
       const hit = await cache.match(VERDICT_CACHE_URL + cacheKey);
-      if (hit) { const verdict = await hit.json(); verdictMemory.set(cacheKey, verdict); return verdict; }
+      if (hit) { const verdict = await hit.json(); memoryRememberVerdict(cacheKey, verdict); return verdict; }
     } catch (error) { /* fall through to KV */ }
   }
   const stored = await getJson(env.LICENSES, cacheKey);
-  if (stored) verdictMemory.set(cacheKey, stored);
+  if (stored) memoryRememberVerdict(cacheKey, stored);
   return stored;
 }
 async function forgetVerdict(env, cacheKey) {
@@ -218,7 +234,7 @@ async function forgetVerdict(env, cacheKey) {
 }
 
 // Resolves { verdict, ... } for a valid licence or { response } to return.
-async function authenticateLicense(key, instanceId, env, deps) {
+async function authenticateLicense(key, instanceId, ip, env, deps) {
   const now = deps.now();
   const cacheMs = toInt(env.LICENSE_CACHE_SECONDS, 600) * 1000;
   const graceSeconds = toInt(env.LICENSE_GRACE_SECONDS, 86400);
@@ -230,6 +246,14 @@ async function authenticateLicense(key, instanceId, env, deps) {
   if (!env.POLAR_ORGANIZATION_ID) {
     deps.log('license_rejected', { key: logTag, reason: 'POLAR_ORGANIZATION_ID is not configured; rejecting every key' });
     return { response: errorResponse(401, 'license_invalid') };
+  }
+
+  // A verdict still fresh in this isolate's memory costs nothing. Anything else may reach the
+  // edge cache, KV and Polar, so it spends one per-IP attempt first (flood guard).
+  const inMemory = verdictMemory.get(cacheKey);
+  if (!(inMemory && now - inMemory.checkedAt < cacheMs)) {
+    const blocked = await licenseAttemptBlocked(ip, logTag, env, deps);
+    if (blocked) return { response: blocked };
   }
 
   const cached = await cachedVerdict(env, cacheKey);
@@ -257,7 +281,8 @@ async function authenticateLicense(key, instanceId, env, deps) {
       const detail = String(result.body.detail ?? '');
       deps.log('license_not_found', { key: logTag, detail });
       verdict = invalidVerdict(inactiveWordIn(detail), now);
-      await rememberVerdict(env, cacheKey, verdict, cacheMs / 1000, deps);
+      // Not-found verdicts stay in isolate memory only: a random key must never cost a KV write.
+      memoryRememberVerdict(cacheKey, verdict);
     } else {
       // 400 / 422: Polar rejected the request itself. Not an outage and not worth caching.
       deps.log('license_rejected', { key: logTag, reason: 'Polar answered ' + result.status });
@@ -323,7 +348,13 @@ async function bindingAllows(env, bindingName, key, deps) {
   }
 }
 
-const minuteExceeded = (now, retryAfterSeconds) =>
+// Logs the refusal (rate_limited) and builds the 429. `limiter` is the binding name, or 'memory'.
+// `subject` is already safe to log: an ip, an app id, or a licence key hash prefix.
+function minuteExceeded(now, retryAfterSeconds, deps, context) {
+  deps.log('rate_limited', { client: context.client, route: context.route, limiter: context.limiter, subjectKind: context.subjectKind, subject: context.subject, ip: context.ip });
+  return minuteResponse(now, retryAfterSeconds);
+}
+const minuteResponse = (now, retryAfterSeconds) =>
   errorResponse(429, 'quota_exceeded', { scope: 'minute' }, { 'Retry-After': String(retryAfterSeconds ?? Math.ceil((Math.floor(now / 60000) * 60000 + 60000 - now) / 1000)) });
 
 // The quota limits for a client: its policy, with the licence client's overridable by
@@ -338,7 +369,7 @@ function quotaLimitsFor(client, env) {
 // without one (local dev, tests) an in-isolate counter stands in. Daily limits are KV
 // counters, buffered in memory. `subject` is what the quota is keyed on: the licence
 // key hash, or "app:<client id>".
-async function applyQuota(subject, limits, env, deps) {
+async function applyQuota(subject, limits, env, deps, context = {}) {
   const now = deps.now();
   const dailyLimit = limits.daily;
   const keys = quotaKeys(subject, now);
@@ -350,16 +381,17 @@ async function applyQuota(subject, limits, env, deps) {
     quotaMemory.set(subject, mem);
   }
   const allowed = await bindingAllows(env, limits.perMinuteBinding, subject, deps);
-  if (allowed === false) return { response: minuteExceeded(now, 60) };
+  if (allowed === false) return { response: minuteExceeded(now, 60, deps, { ...context, limiter: limits.perMinuteBinding }) };
   if (allowed === null && limits.perMinute !== null) {
     if (mem.minuteKey !== keys.minute) { mem.minuteKey = keys.minute; mem.minuteCount = 0; }
     mem.minuteCount += 1;
-    if (mem.minuteCount > limits.perMinute) return { response: minuteExceeded(now) };
+    if (mem.minuteCount > limits.perMinute) return { response: minuteExceeded(now, undefined, deps, { ...context, limiter: 'memory' }) };
   }
   mem.pending += 1;
   const dayCount = mem.base + mem.pending;
   if (mem.pending >= QUOTA_FLUSH_EVERY || dayCount === dailyLimit + 1) await flushQuota(mem, env, deps);
   if (dayCount > dailyLimit) {
+    deps.log('quota_exceeded', { client: context.client, route: context.route, subjectKind: context.subjectKind, subject: context.subject, ip: context.ip });
     const nextMidnight = Date.UTC(new Date(now).getUTCFullYear(), new Date(now).getUTCMonth(), new Date(now).getUTCDate() + 1);
     return { response: errorResponse(429, 'quota_exceeded', { scope: 'day' }, { 'Retry-After': String(Math.ceil((nextMidnight - now) / 1000)) }) };
   }
@@ -369,7 +401,7 @@ async function applyQuota(subject, limits, env, deps) {
 // A license verdict is cached to spare Polar, not to decide anything: a failed write is logged
 // and the request carries on with the verdict it already has.
 async function rememberVerdict(env, cacheKey, verdict, ttlSeconds, deps) {
-  verdictMemory.set(cacheKey, verdict);
+  memoryRememberVerdict(cacheKey, verdict);
   const cache = edgeCache();
   if (cache) {
     try {
@@ -447,7 +479,10 @@ function health(env) {
 
 async function activateRoute(request, env, deps) {
   const body = await readBodyText(request);
-  if (body.tooLarge) return errorResponse(413, 'payload_too_large');
+  if (body.tooLarge) {
+    deps.log('request_rejected', { reason: 'payload_too_large', route: 'gateway:license.activate', client: deps.clients.anonymous.id, ip: callerIp(request) });
+    return errorResponse(413, 'payload_too_large');
+  }
   let parsed = null;
   try {
     parsed = JSON.parse(body.text);
@@ -464,6 +499,8 @@ async function activateRoute(request, env, deps) {
     deps.log('license_activate_rejected', { key: logTag, reason: 'POLAR_ORGANIZATION_ID is not configured; rejecting every key' });
     return errorResponse(401, 'license_invalid');
   }
+  const blocked = await licenseAttemptBlocked(callerIp(request), logTag, env, deps);
+  if (blocked) return blocked;
   let result = null;
   try {
     result = await polar.activate(licenseKey, instanceName, env, deps.fetch);
@@ -550,7 +587,10 @@ async function serviceRoute(request, url, route, upstreamPath, caller, env, deps
   let body;
   if (request.method === 'POST') {
     const read = await readBodyText(request);
-    if (read.tooLarge) return errorResponse(413, 'payload_too_large');
+    if (read.tooLarge) {
+      deps.log('request_rejected', { reason: 'payload_too_large', route: route.id, client: caller.client.id, ip: callerIp(request) });
+      return errorResponse(413, 'payload_too_large');
+    }
     body = read.text;
   }
   let quoteItems = null;
@@ -562,7 +602,10 @@ async function serviceRoute(request, url, route, upstreamPath, caller, env, deps
     }
     if (!Array.isArray(quoteItems)) return errorResponse(400, 'invalid_body');
     const max = caller.client.maxQuoteItems;
-    if (max !== null && quoteItems.length > max) return errorResponse(413, 'batch_too_large', { max });
+    if (max !== null && quoteItems.length > max) {
+      deps.log('request_rejected', { reason: 'batch_too_large', route: route.id, client: caller.client.id, count: quoteItems.length, max, ip: callerIp(request) });
+      return errorResponse(413, 'batch_too_large', { max });
+    }
   }
 
   const access = accessHeaders(env);
@@ -652,29 +695,43 @@ const DEFAULT_SESSION_TTL_SECONDS = 1800;
 async function sessionRoute(request, env, deps) {
   const origin = request.headers.get('origin') || '';
   const client = (deps.clients.publicSessions ?? []).find((c) => c.origins.includes(origin));
-  if (!client) return errorResponse(403, 'origin_not_allowed');
+  if (!client) {
+    deps.log('session_refused', { reason: 'origin_not_allowed', origin: origin.slice(0, 200), ip: callerIp(request) });
+    return errorResponse(403, 'origin_not_allowed');
+  }
   if (!env.TURNSTILE_SECRET_KEY || !env.SESSION_SIGNING_KEY) {
     deps.log('session_not_configured', { missing: [!env.TURNSTILE_SECRET_KEY && 'TURNSTILE_SECRET_KEY', !env.SESSION_SIGNING_KEY && 'SESSION_SIGNING_KEY'].filter(Boolean) });
     return errorResponse(503, 'session_not_configured');
   }
   const read = await readBodyText(request);
-  if (read.tooLarge) return errorResponse(413, 'payload_too_large');
+  if (read.tooLarge) {
+    deps.log('request_rejected', { reason: 'payload_too_large', route: 'gateway:session', client: client.id, ip: callerIp(request) });
+    return errorResponse(413, 'payload_too_large');
+  }
   let widgetToken = null;
   try {
     widgetToken = JSON.parse(read.text).turnstileToken;
   } catch {
     widgetToken = null;
   }
-  if (typeof widgetToken !== 'string' || widgetToken.length < 1 || widgetToken.length > 2048) return errorResponse(400, 'invalid_body');
+  if (typeof widgetToken !== 'string' || widgetToken.length < 1 || widgetToken.length > 2048) {
+    deps.log('session_refused', { client: client.id, reason: 'bad body', ip: callerIp(request) });
+    return errorResponse(400, 'invalid_body');
+  }
 
   const verdict = await verifyTurnstile(widgetToken, request.headers.get('cf-connecting-ip'), env.TURNSTILE_SECRET_KEY, deps.fetch);
   if (verdict.unavailable) return errorResponse(503, 'turnstile_unavailable', {}, { 'Retry-After': '5' });
   if (!verdict.ok) {
-    deps.log('session_refused', { client: client.id, reason: 'turnstile', errorCodes: verdict.errorCodes });
+    deps.log('session_refused', { client: client.id, reason: 'turnstile', errorCodes: verdict.errorCodes, ip: callerIp(request) });
     return errorResponse(403, 'turnstile_failed');
   }
   if (verdict.hostname !== new URL(origin).hostname) {
-    deps.log('session_refused', { client: client.id, reason: 'hostname', hostname: verdict.hostname });
+    deps.log('session_refused', { client: client.id, reason: 'hostname', hostname: verdict.hostname, ip: callerIp(request) });
+    return errorResponse(403, 'turnstile_failed');
+  }
+  // a token from a different widget on the same hostname must not buy a session
+  if (verdict.action !== client.turnstileAction) {
+    deps.log('session_refused', { client: client.id, reason: 'action mismatch', action: verdict.action, ip: callerIp(request) });
     return errorResponse(403, 'turnstile_failed');
   }
   const ttlSeconds = toInt(env.SESSION_TTL_SECONDS, DEFAULT_SESSION_TTL_SECONDS) || DEFAULT_SESSION_TTL_SECONDS;
@@ -687,13 +744,16 @@ async function sessionRoute(request, env, deps) {
 // be correctly signed, unexpired, name a public client, and be used from its own Origin.
 async function identifySession(token, request, env, deps) {
   const invalid = (reason) => {
-    deps.log('session_invalid', { reason });
+    deps.log('session_invalid', { reason, ip: callerIp(request) });
     return { response: errorResponse(401, 'session_invalid') };
   };
   if (!env.SESSION_SIGNING_KEY) return invalid('SESSION_SIGNING_KEY is not configured');
   const session = await readSessionToken(token, env.SESSION_SIGNING_KEY);
   if (!session) return invalid('bad signature or format');
-  if (session.expiresAt <= deps.now()) return { response: errorResponse(401, 'session_expired') };
+  if (session.expiresAt <= deps.now()) {
+    deps.log('session_expired', { client: session.clientId, ip: callerIp(request) });
+    return { response: errorResponse(401, 'session_expired') };
+  }
   const client = (deps.clients.publicSessions ?? []).find((c) => c.id === session.clientId);
   if (!client) return invalid('unknown client ' + session.clientId);
   const origin = request.headers.get('origin');
@@ -712,9 +772,13 @@ async function identifyCaller(request, env, deps) {
   if (!header) return { client: clients.anonymous, subject: null };
   const session = /^Session\s+(\S+)$/i.exec(header);
   if (session) return identifySession(session[1], request, env, deps);
-  if (!/^Bearer\s/i.test(header)) return { response: errorResponse(401, 'credential_invalid') };
+  const credentialInvalid = (reason) => {
+    deps.log('credential_invalid', { reason, ip: callerIp(request) });
+    return { response: errorResponse(401, 'credential_invalid') };
+  };
+  if (!/^Bearer\s/i.test(header)) return credentialInvalid('unsupported scheme');
   const key = licenseKeyFrom(request);
-  if (!key) return { response: errorResponse(401, 'credential_invalid') };
+  if (!key) return credentialInvalid('malformed bearer value');
 
   // 1. App keys first: an exact hash match. A licence key never matches an app-key hash.
   const keyHash = await sha256Hex(key);
@@ -723,8 +787,11 @@ async function identifyCaller(request, env, deps) {
 
   // 2. Otherwise a licence, which needs its activation id. 3. Otherwise 401.
   const instanceId = instanceIdFrom(request);
-  if (!instanceId) return { response: errorResponse(401, 'license_required') };
-  const license = await authenticateLicense(key, instanceId, env, deps);
+  if (!instanceId) {
+    deps.log('credential_invalid', { reason: 'license_required: missing or malformed X-Instance-Id', key: keyHash.slice(0, 8), ip: callerIp(request) });
+    return { response: errorResponse(401, 'license_required') };
+  }
+  const license = await authenticateLicense(key, instanceId, callerIp(request), env, deps);
   if (license.response) return { response: license.response };
   return { client: clients.license, license, subject: license.keyHash };
 }
@@ -752,7 +819,10 @@ async function route(request, env, deps) {
 
   // 3. The client's policy must allow the route. Open routes are allowed to everyone.
   if (!isOpenRoute(route.id) && !client.routes.includes(route.id)) {
-    if (client.auth === 'none') return errorResponse(401, 'credential_required');
+    if (client.auth === 'none') {
+      deps.log('credential_invalid', { reason: 'credential_required', route: route.id, client: client.id, ip: callerIp(request) });
+      return errorResponse(401, 'credential_required');
+    }
     deps.log('route_forbidden', { route: route.id, client: client.id });
     return errorResponse(403, 'forbidden');
   }
@@ -762,9 +832,14 @@ async function route(request, env, deps) {
   let quota = null;
   if (client.auth === 'none' || client.auth === 'public-session') {
     const allowed = await bindingAllows(env, client.quota.perMinuteBinding, 'ip:' + callerIp(request), deps);
-    if (allowed === false) return minuteExceeded(deps.now(), 60);
+    if (allowed === false) return minuteExceeded(deps.now(), 60, deps, { client: client.id, route: route.id, limiter: client.quota.perMinuteBinding, subjectKind: 'ip', subject: callerIp(request), ip: callerIp(request) });
   } else {
-    quota = await applyQuota(caller.subject, quotaLimitsFor(client, env), env, deps);
+    const isApp = String(caller.subject).startsWith('app:');
+    quota = await applyQuota(caller.subject, quotaLimitsFor(client, env), env, deps, {
+      client: client.id, route: route.id, ip: callerIp(request),
+      subjectKind: isApp ? 'app' : 'license',
+      subject: isApp ? String(caller.subject).slice(4) : String(caller.subject).slice(0, 8),
+    });
     if (quota.response) return quota.response;
   }
 
