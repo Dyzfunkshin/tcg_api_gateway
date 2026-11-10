@@ -36,7 +36,10 @@ python tools/push_secrets.py [--only NAME] [--generate-session-key] [--apply]
 python tools/cutover.py [--preflight | --apply] # G3 cut-over + G4 Access lock; stops for typed go-aheads
 ```
 
-`wrangler` is not a dependency of this repo; use `npx wrangler` when deploying.
+`wrangler` is not a dependency of this repo; use `npx wrangler@4` when deploying.
+**Never deploy with wrangler 3:** it silently ignores the `[[ratelimits]]` bindings
+(only a warning) and the Worker then runs with no per-minute limits. Check the
+binding list in `npx wrangler@4 deploy --dry-run` output before any real deploy.
 
 ## Rules
 
