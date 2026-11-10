@@ -376,6 +376,8 @@ only fixes the names and fields it will key on.
 Do G0–G4 before onboarding any new client: they move today's live traffic
 safely, and the lock (G4) is the security win on its own.
 
+**G3 done (2026-11-10).** `api.dyzzyscards.com` and `api.mintuition.app` are Custom Domains on `tcg-api-gateway`; `sourcery-gateway` serves nothing. Access service token `tcg-api-gateway` created, both halves in Bitwarden (`TCG_GATEWAY_ACCESS_CLIENT_ID` / `_SECRET`) and pushed. Incident: the first run read Cloudflare's empty 204 on the domain DELETE as a failure and left `api.dyzzyscards.com` on no Worker for about 20 minutes (no shipped clients affected); fixed in `tools/cloudflare_api.py` with a regression test, and the re-run attached both hosts. Smoke test on both hosts: health 200, pricing health 200, uncredentialed calls 401, fake licence 401, fake Turnstile 403. **G4 (the lock) is held** until pricing's freshness alert polls the gateway (section 4 knock-on change). The deployed-e2e script uses Polar sandbox keys, which production Polar refuses; licence e2e needs a production key.
+
 **G0 deployed (2026-11-10).** `tcg-api-gateway` runs on `https://tcg-api-gateway.matthew-722.workers.dev` (wrangler 4, all six rate-limit bindings), from `dev` at that date. Worker secrets pushed: `PRICING_APP_TOKEN`, `CATALOG_APP_TOKEN`, `TURNSTILE_SECRET_KEY`, `SESSION_SIGNING_KEY` (Access pair waits for G3/G4). Smoke test: `/v1/health` both origins true; `/pricing/v1/health` 200 through the gateway; quote without credential 401; `/v1/session` fake token 403 `turnstile_failed`, foreign Origin 403 `origin_not_allowed`. `api.dyzzyscards.com` still on `sourcery-gateway`.
 
 **Build gates (2026-11-09).** G0 and G1 are built and tested **offline

@@ -1,9 +1,12 @@
 name = "tcg-api-gateway"
 main = "src/worker.js"
 compatibility_date = "2026-10-01"
-# G0-G2: workers.dev only. api.dyzzyscards.com stays on sourcery-gateway until the
-# G3 cut-over (docs/PLAN.md section 8), which re-adds:
-#   routes = [{ pattern = "api.dyzzyscards.com", custom_domain = true }]
+# Custom domains since the G3 cut-over (2026-11-10, docs/PLAN.md section 8). Listed here so
+# every deploy keeps them attached; api.mintuition.app is the Mintuition extension's host.
+routes = [
+  { pattern = "api.dyzzyscards.com", custom_domain = true },
+  { pattern = "api.mintuition.app", custom_domain = true },
+]
 workers_dev = true
 
 # Create with: npx wrangler kv namespace create LICENSES
