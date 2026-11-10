@@ -10,7 +10,7 @@ import * as polar from './polar.js';
 import { matchPath } from './routes.js';
 import { DEFAULT_CLIENTS, isOpenRoute, originMatches } from './clients.js';
 import { issueSessionToken, readSessionToken, verifyTurnstile } from './session.js';
-import { cacheUrlForGet, cacheUrlForQuoteItem, cacheGet, cachePut, headersOf } from './edge-cache.js';
+import { cacheUrlForGet, cacheUrlForQuoteItem, isCacheableQuoteAnswer, cacheGet, cachePut, headersOf } from './edge-cache.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const INACTIVE_STATUSES = new Set(['expired', 'revoked', 'disabled']);
@@ -201,10 +201,20 @@ function memoryRememberVerdict(cacheKey, verdict) {
 // Returns a 429 response when over the limit, else null. Binding absent = allowed;
 // a binding error fails open (bindingAllows logs it).
 async function licenseAttemptBlocked(ip, logTag, env, deps) {
-  const allowed = await bindingAllows(env, 'RATE_LIMIT_LICENSE_ATTEMPTS', 'ip:' + ip, deps);
+  const allowed = await bindingAllows(env, 'RATE_LIMIT_LICENSE_ATTEMPTS', ipLimiterKey(ip), deps);
   if (allowed !== false) return null;
   deps.log('license_attempts_limited', { ip, key: logTag });
   return errorResponse(429, 'license_attempts_exceeded', {}, { 'Retry-After': '60' });
+}
+
+// Global cap on calls to Polar (RATE_LIMIT_POLAR, one shared key): Polar allows about 3 licence
+// requests a second for the whole organisation, so random keys spread over many IPs could
+// otherwise use it all and leave every uncached real user with a 503. false = do not call Polar
+// (logged); binding absent or erroring = allowed.
+async function polarCallAllowed(op, logTag, env, deps) {
+  if ((await bindingAllows(env, 'RATE_LIMIT_POLAR', 'polar', deps)) !== false) return true;
+  deps.log('license_polar_limited', { op, key: logTag });
+  return false;
 }
 // Second layer (2026-11-07): the colo's edge cache (Cache API), which has no daily write limit,
 // so a fresh isolate in the same colo finds the verdict without a Polar call even while KV
@@ -230,7 +240,8 @@ async function forgetVerdict(env, cacheKey) {
   verdictMemory.delete(cacheKey);
   const cache = edgeCache();
   if (cache) { try { await cache.delete(VERDICT_CACHE_URL + cacheKey); } catch (error) { /* best effort */ } }
-  await deleteKey(env.LICENSES, cacheKey);
+  // A KV delete counts against the 1,000 writes a day; reads do not, so only delete what exists.
+  if ((await getJson(env.LICENSES, cacheKey)) !== null) await deleteKey(env.LICENSES, cacheKey);
 }
 
 // Resolves { verdict, ... } for a valid licence or { response } to return.
@@ -261,10 +272,14 @@ async function authenticateLicense(key, instanceId, ip, env, deps) {
 
   if (!verdict) {
     let result = null;
-    try {
-      result = await polar.validate(key, instanceId, env, deps.fetch);
-    } catch (error) {
-      deps.log('license_validate_failed', { key: logTag, error: String(error && error.message) });
+    if (!(await polarCallAllowed('validate', logTag, env, deps))) {
+      result = { status: 429, body: null }; // treated as a Polar outage: grace for a cached key, else 503
+    } else {
+      try {
+        result = await polar.validate(key, instanceId, env, deps.fetch);
+      } catch (error) {
+        deps.log('license_validate_failed', { key: logTag, error: String(error && error.message) });
+      }
     }
     if (!result || isUnavailable(result) || ![200, 400, 404, 422].includes(result.status)) {
       if (cached && cached.valid && now - cached.checkedAt < graceSeconds * 1000) {
@@ -281,8 +296,16 @@ async function authenticateLicense(key, instanceId, ip, env, deps) {
       const detail = String(result.body.detail ?? '');
       deps.log('license_not_found', { key: logTag, detail });
       verdict = invalidVerdict(inactiveWordIn(detail), now);
-      // Not-found verdicts stay in isolate memory only: a random key must never cost a KV write.
-      memoryRememberVerdict(cacheKey, verdict);
+      if (cached && cached.valid) {
+        // Revoked since a valid verdict was cached. Overwrite the shared copies (edge cache and
+        // KV) with the refusal, kept for the grace window, so no isolate's grace path revives
+        // the key while Polar is unreachable. Only keys that once validated reach this write.
+        deps.log('license_revoked_cached', { key: logTag });
+        await rememberVerdict(env, cacheKey, verdict, graceSeconds, deps);
+      } else {
+        // Not-found verdicts stay in isolate memory only: a random key must never cost a KV write.
+        memoryRememberVerdict(cacheKey, verdict);
+      }
     } else {
       // 400 / 422: Polar rejected the request itself. Not an outage and not worth caching.
       deps.log('license_rejected', { key: logTag, reason: 'Polar answered ' + result.status });
@@ -400,7 +423,8 @@ async function applyQuota(subject, limits, env, deps, context = {}) {
 
 // A license verdict is cached to spare Polar, not to decide anything: a failed write is logged
 // and the request carries on with the verdict it already has.
-async function rememberVerdict(env, cacheKey, verdict, ttlSeconds, deps) {
+// `toKv: false` keeps it to memory and the edge cache (no daily write limit).
+async function rememberVerdict(env, cacheKey, verdict, ttlSeconds, deps, { toKv = true } = {}) {
   memoryRememberVerdict(cacheKey, verdict);
   const cache = edgeCache();
   if (cache) {
@@ -410,6 +434,7 @@ async function rememberVerdict(env, cacheKey, verdict, ttlSeconds, deps) {
       deps.log('license_edge_cache_unavailable', { error: String(error && error.message) });
     }
   }
+  if (!toKv) return;
   try {
     await putJson(env.LICENSES, cacheKey, verdict, ttlSeconds);
   } catch (error) {
@@ -437,11 +462,29 @@ function accessHeaders(env) {
   return { 'cf-access-client-id': id, 'cf-access-client-secret': secret };
 }
 
+// The body as text, or { tooLarge } past MAX_BODY_BYTES. The declared length is only a fast
+// path: a chunked body has none, so the stream is counted as it is read and cancelled the
+// moment it passes the cap, never buffered whole.
 async function readBodyText(request) {
   const declared = Number.parseInt(request.headers.get('content-length') ?? '', 10);
   if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return { tooLarge: true };
-  const buffer = await request.arrayBuffer();
-  if (buffer.byteLength > MAX_BODY_BYTES) return { tooLarge: true };
+  if (!request.body) return { text: '' };
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BODY_BYTES) {
+      reader.cancel().catch(() => {});
+      return { tooLarge: true };
+    }
+    chunks.push(value);
+  }
+  const buffer = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.byteLength; }
   return { text: new TextDecoder().decode(buffer) };
 }
 
@@ -505,6 +548,7 @@ async function activateRoute(request, env, deps) {
   }
   const blocked = await licenseAttemptBlocked(callerIp(request), logTag, env, deps);
   if (blocked) return blocked;
+  if (!(await polarCallAllowed('activate', logTag, env, deps))) return unavailableResponse(null);
   let result = null;
   try {
     result = await polar.activate(licenseKey, instanceName, env, deps.fetch);
@@ -532,9 +576,12 @@ async function activateRoute(request, env, deps) {
     deps.log('license_activate_rejected', { key: logTag, reason: rejection.reason });
     return rejection.response;
   }
-  // Seed the verdict so the first authed request does not need another validate call.
+  // Seed the verdict so the first authed request does not need another validate call. Memory
+  // and the colo's edge cache only, never KV: every activate makes a new activation id, so a
+  // valid key cycling activate/deactivate would otherwise spend a KV write each round
+  // (2026-11-09 review). The first validate from another colo writes KV as usual.
   const cacheKey = 'lic:' + (await sha256Hex(`${licenseKey}|${activationId}`));
-  await rememberVerdict(env, cacheKey, verdict, toInt(env.LICENSE_GRACE_SECONDS, 86400), deps);
+  await rememberVerdict(env, cacheKey, verdict, toInt(env.LICENSE_GRACE_SECONDS, 86400), deps, { toKv: false });
   return jsonResponse(200, {
     instanceId: activationId,
     status: verdict.status,
@@ -546,6 +593,7 @@ async function activateRoute(request, env, deps) {
 }
 
 async function deactivateRoute(auth, env, deps) {
+  if (!(await polarCallAllowed('deactivate', auth.keyHash.slice(0, 8), env, deps))) return unavailableResponse(null);
   let result = null;
   try {
     result = await polar.deactivate(auth.key, auth.instanceId, env, deps.fetch);
@@ -685,7 +733,7 @@ async function cachedQuote(request, target, headers, items, ttlSeconds, deps) {
     missIndexes.map((index, position) => {
       answers[index] = data[position];
       const cacheUrl = cacheUrls[index];
-      return cacheUrl ? cachePut(deps.cache, cacheUrl, JSON.stringify(data[position]), { 'content-type': 'application/json' }, ttlSeconds, deps.log) : null;
+      return cacheUrl && isCacheableQuoteAnswer(data[position]) ? cachePut(deps.cache, cacheUrl, JSON.stringify(data[position]), { 'content-type': 'application/json' }, ttlSeconds, deps.log) : null;
     }),
   );
   return respond(missIndexes.length === items.length ? 'miss' : 'partial');
@@ -764,7 +812,8 @@ async function identifySession(token, request, env, deps) {
   if (!client) return invalid('unknown client ' + session.clientId);
   const origin = request.headers.get('origin');
   if (origin !== session.origin || !client.origins.includes(origin)) return invalid('origin mismatch');
-  return { client, subject: null };
+  // A token is limited on its own too (the IP alone can rotate); keyed and logged by a hash prefix, never the token.
+  return { client, subject: null, sessionTag: (await sha256Hex(token)).slice(0, 16) };
 }
 
 // ---------- callers ----------
@@ -804,6 +853,48 @@ async function identifyCaller(request, env, deps) {
 
 const callerIp = (request) => request.headers.get('cf-connecting-ip') || 'unknown';
 
+// The rate-limiter key for a caller's IP. IPv4 is keyed as is; IPv6 on its /64, since one
+// subscriber usually holds a whole /64 and could otherwise rotate past every per-IP limit.
+// An IPv4-mapped IPv6 address is keyed as its IPv4. Anything unparsable is keyed verbatim.
+export function ipLimiterKey(ip) {
+  const raw = String(ip ?? '').trim().toLowerCase();
+  if (!raw.includes(':')) return 'ip:' + raw;
+  const groups = ipv6Groups(raw.replace(/%.*$/, ''));
+  if (!groups) return 'ip:' + raw.slice(0, 64);
+  if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
+    return 'ip:' + [groups[6] >> 8, groups[6] & 255, groups[7] >> 8, groups[7] & 255].join('.');
+  }
+  return 'ip:' + groups.slice(0, 4).map((g) => g.toString(16)).join(':') + '::/64';
+}
+
+// "2001:db8::1" -> eight 16-bit numbers, or null. Handles one "::" and a dotted IPv4 tail.
+function ipv6Groups(text) {
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const parse = (part) => {
+    if (part === '') return [];
+    const out = [];
+    for (const piece of part.split(':')) {
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(piece)) {
+        const octets = piece.split('.').map(Number);
+        if (octets.some((o) => o > 255)) return null;
+        out.push((octets[0] << 8) | octets[1], (octets[2] << 8) | octets[3]);
+      } else if (/^[0-9a-f]{1,4}$/.test(piece)) {
+        out.push(Number.parseInt(piece, 16));
+      } else {
+        return null;
+      }
+    }
+    return out;
+  };
+  const head = parse(halves[0]);
+  const tail = halves.length === 2 ? parse(halves[1]) : [];
+  if (!head || !tail) return null;
+  if (halves.length === 1) return head.length === 8 ? head : null;
+  const missing = 8 - head.length - tail.length;
+  return missing >= 1 ? [...head, ...new Array(missing).fill(0), ...tail] : null;
+}
+
 // ---------- routing ----------
 
 async function route(request, env, deps) {
@@ -833,12 +924,16 @@ async function route(request, env, deps) {
     return errorResponse(403, 'forbidden');
   }
 
-  // 4. Quota. Anonymous and public-session callers are limited per IP (binding only);
-  // licences and app keys per credential, with a daily KV quota.
+  // 4. Quota. Anonymous and public-session callers are limited per IP (an IPv6 /64; binding
+  // only), public sessions also per token; licences and app keys per credential, with a
+  // daily KV quota.
   let quota = null;
   if (client.auth === 'none' || client.auth === 'public-session') {
-    const allowed = await bindingAllows(env, client.quota.perMinuteBinding, 'ip:' + callerIp(request), deps);
-    if (allowed === false) return minuteExceeded(deps.now(), 60, deps, { client: client.id, route: route.id, limiter: client.quota.perMinuteBinding, subjectKind: 'ip', subject: callerIp(request), ip: callerIp(request) });
+    const binding = client.quota.perMinuteBinding;
+    const ipKey = ipLimiterKey(callerIp(request));
+    const refuse = (subjectKind, subject) => minuteExceeded(deps.now(), 60, deps, { client: client.id, route: route.id, limiter: binding, subjectKind, subject, ip: callerIp(request) });
+    if ((await bindingAllows(env, binding, ipKey, deps)) === false) return refuse('ip', ipKey.slice(3));
+    if (caller.sessionTag && (await bindingAllows(env, binding, 'session:' + caller.sessionTag, deps)) === false) return refuse('session', caller.sessionTag);
   } else {
     const isApp = String(caller.subject).startsWith('app:');
     quota = await applyQuota(caller.subject, quotaLimitsFor(client, env), env, deps, {

@@ -342,13 +342,15 @@ or secret: licence keys appear only as the 8-character hash prefix (`key`, or
 |---|---|---|
 | `credential_invalid` | 401 for an unusable credential: unsupported scheme, malformed bearer value, Bearer licence without a valid `X-Instance-Id` (`license_required`), or an anonymous call to a protected route (`credential_required`) | `reason`, `ip`; `key` (hash prefix) for the instance case; `client`, `route` for `credential_required` |
 | `license_rejected` / `license_not_found` / `license_service_unavailable` / `license_attempts_limited` | licence verdict refused, unknown, Polar unreachable, or per-IP attempt cap hit | `key` (hash prefix), `reason`/`detail`/`status`, `ip` |
+| `license_polar_limited` | the global Polar budget (`RATE_LIMIT_POLAR`) is spent, so a validate, activate or deactivate call to Polar is skipped (a validate then falls back to grace or 503) | `op`, `key` (hash prefix) |
+| `license_revoked_cached` | Polar answered 404 for a key that had a cached valid verdict; the shared copies are overwritten with the refusal | `key` (hash prefix) |
 | `session_refused` | `POST /v1/session` refused: `origin_not_allowed`, `bad body`, `turnstile`, `hostname`, `action mismatch` | `reason`, `client` (except origin_not_allowed), `ip`, plus `origin` / `errorCodes` / `hostname` / `action` as relevant |
 | `session_invalid` | session token bad signature, unknown client, origin mismatch, or signing key unset | `reason`, `ip` |
 | `session_expired` | a correctly signed session token past its expiry | `client`, `ip` |
 | `route_forbidden` | 403, the client's policy does not allow the route | `route`, `client` |
-| `rate_limited` | per-minute refusal, from a rate-limit binding or the in-memory counter | `client`, `route`, `limiter` (binding name or `memory`), `subjectKind` (`ip`, `app`, `license`), `subject` (ip, app id, or hash prefix), `ip` |
+| `rate_limited` | per-minute refusal, from a rate-limit binding or the in-memory counter | `client`, `route`, `limiter` (binding name or `memory`), `subjectKind` (`ip`, `session`, `app`, `license`), `subject` (ip or IPv6 /64, session-token hash prefix, app id, or licence hash prefix), `ip` |
 | `quota_exceeded` | daily quota refusal | `client`, `route`, `subjectKind`, `subject`, `ip` |
-| `request_rejected` | 413: `reason` is `payload_too_large` or `batch_too_large` | `reason`, `route`, `client`, `ip`; `count`, `max` for batches |
+| `request_rejected` | 413: `reason` is `payload_too_large` (declared or, for a chunked body, counted while streaming) or `batch_too_large` | `reason`, `route`, `client`, `ip`; `count`, `max` for batches |
 | `rate_limiter_unavailable`, `access_misconfigured`, `session_not_configured` | operational failures (fail open / 503) | `binding` or `reason`/`missing`, `error` |
 
 Alerting on these events is a separate, deploy-gated task (#9); this section
@@ -490,3 +492,35 @@ sections above):
     form, say), that token cannot buy a session. poke-guide uses the widget
     only for sessions today, so this is cheap insurance for later, not a
     current defence. poke_guide was notified through the huddle's notices.
+
+**2026-11-09, security review fixes (branch `fix/security-review-findings`):**
+
+19. **Quote cache keys are exact.** Per-item quote cache entries are keyed
+    on the exact `game` / `condition` / `printing` pricing receives (pricing
+    matches `game` verbatim). An item whose selector is present but not
+    canonical (`game` `^[a-z0-9-]{1,64}$`; condition/printing words of
+    `[A-Za-z0-9-]` with single spaces, at most 64 chars) is forwarded but
+    never cached, and an answer without a `market` price is never stored.
+20. **Body cap on chunked bodies.** The 1 MB cap is enforced while the body
+    streams in; past it the stream is cancelled and the answer is
+    `413 payload_too_large`.
+21. **Per-IP keys use the IPv6 /64.** Every per-IP limiter key goes through
+    one helper (IPv4 unchanged, IPv6 keyed on its /64, mapped IPv4 as
+    IPv4). Public sessions are also limited per token on
+    `RATE_LIMIT_SESSION`, keyed `session:<sha256 prefix>`, never the token.
+22. **Global Polar budget.** `RATE_LIMIT_POLAR` (one key, 120 a minute) sits
+    in front of every Polar call. When it trips, a cached key still works
+    (inside its grace window) and an uncached key gets
+    `503 license_service_unavailable` with `Retry-After`.
+23. **Revocations stick.** A Polar 404 for a key with a cached valid verdict
+    overwrites the edge-cache and KV copies with the refusal for the grace
+    window, so no grace path revives it. Isolates that still hold the valid
+    verdict in memory keep it until it falls out of memory or the cache
+    window ends and Polar answers again.
+24. **Activate spends no KV writes.** Activate seeds its verdict in memory
+    and the colo's edge cache only (each activate is a new activation id, so
+    activate/deactivate cycling used to cost a KV write a round), and a
+    deactivate deletes the KV copy only when one exists.
+25. **Tag-write keys.** The `catalog:tags.write` segment allows the `<file>`
+    characters plus percent-escapes that cannot decode to `/`, `\`, `.` or a
+    control character, with no leading dot.

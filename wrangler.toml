@@ -49,14 +49,22 @@ namespace_id = "1001"
 simple = { limit = 300, period = 60 }
 
 # Flood guard: caps licence checks per IP that could reach Polar or KV (random-key floods).
-# Keyed by IP; verdicts already in isolate memory do not spend an attempt.
+# Keyed by IP (IPv6 /64); verdicts already in isolate memory do not spend an attempt.
 [[ratelimits]]
 name = "RATE_LIMIT_LICENSE_ATTEMPTS"
 namespace_id = "1005"
 simple = { limit = 20, period = 60 }
 
+# Global Polar budget: one key ("polar") for every caller, in front of every Polar call.
+# Polar allows ~3 licence requests/s; when this trips, cached keys ride their grace window
+# and uncached keys get 503 license_service_unavailable. Named by no client policy.
 [[ratelimits]]
-name = "RATE_LIMIT_PUBLIC"    # anonymous callers, keyed by IP
+name = "RATE_LIMIT_POLAR"
+namespace_id = "1006"
+simple = { limit = 120, period = 60 }
+
+[[ratelimits]]
+name = "RATE_LIMIT_PUBLIC"    # anonymous callers, keyed by IP (IPv6 /64)
 namespace_id = "1002"
 simple = { limit = 60, period = 60 }
 
@@ -66,6 +74,6 @@ namespace_id = "1003"
 simple = { limit = 600, period = 60 }
 
 [[ratelimits]]
-name = "RATE_LIMIT_SESSION"   # public-session clients (poke-guide), keyed by IP
+name = "RATE_LIMIT_SESSION"   # public-session clients (poke-guide), keyed by IP (IPv6 /64) and, separately, by session token hash
 namespace_id = "1004"
 simple = { limit = 300, period = 60 }

@@ -1,7 +1,7 @@
 // Sourcery gateway tests. Plain node:assert, no dependencies.
 // Run: node gateway/test/run.js   (exits non-zero on any failure)
 import assert from 'node:assert/strict';
-import { handle, licenseKeyFrom, corsHeaders, corsOriginsOf, quotaKeys, resetQuotaMemory } from '../src/worker.js';
+import { handle, licenseKeyFrom, corsHeaders, corsOriginsOf, quotaKeys, resetQuotaMemory, ipLimiterKey } from '../src/worker.js';
 import { DEFAULT_CLIENTS, LICENSE_CLIENT, ANONYMOUS_CLIENT, assertValidClients } from '../src/clients.js';
 import { matchPath } from '../src/routes.js';
 
@@ -487,6 +487,61 @@ test('licence flood guard: deactivate is guarded (allow and deny)', async () => 
   eq(w.polarCalls('deactivate').length, 1);
 });
 
+// Global Polar budget: RATE_LIMIT_POLAR, one key for every caller, in front of each Polar call.
+test('polar budget: within it Polar is called (allow, keyed "polar"); a fresh cached verdict never spends it', async () => {
+  const limiter = fakeRateLimiter(1);
+  const w = createWorld({ RATE_LIMIT_POLAR: limiter });
+  eq((await w.send('/v1/license')).status, 200);
+  eq((await w.send('/v1/license')).status, 200);
+  eq([w.polarCalls('validate').length, limiter.keys], [1, ['polar']]);
+});
+
+test('polar budget: exhausted, an uncached key is 503 with Retry-After and logged (deny); a cached key rides its grace (allow)', async () => {
+  const limiter = fakeRateLimiter(1);
+  const w = createWorld({ RATE_LIMIT_POLAR: limiter });
+  eq((await w.send('/v1/license')).status, 200, 'spends the one call');
+  let res = await w.send('/v1/license', { key: 'random-flood-key-1' });
+  eq([res.status, res.headers.get('retry-after'), await readJson(res)], [503, '30', { error: 'license_service_unavailable' }]);
+  eq(w.polarCalls('validate').length, 1, 'no Polar call once the budget is spent');
+  const entry = eventsNamed(w, 'license_polar_limited')[0];
+  eq([entry.op, entry.key.length], ['validate', 8]);
+  ok(!JSON.stringify(w.logs).includes('random-flood-key-1'));
+  w.clock.t += 601 * 1000; // past the cache window, inside the grace window
+  res = await w.send('/v1/license');
+  eq(res.status, 200, 'the cached valid verdict is reused');
+  ok(eventsNamed(w, 'license_grace_reuse').length === 1);
+  res = await w.send('/v1/license/activate', { method: 'POST', key: null, instance: null, body: { licenseKey: KEY, instanceName: 'x' } });
+  eq([res.status, res.headers.get('retry-after')], [503, '30'], 'activate is refused too');
+  res = await w.send('/v1/license/deactivate', { method: 'POST' });
+  eq(res.status, 503, 'deactivate is refused too');
+  eq(w.polarCalls('activate').length + w.polarCalls('deactivate').length, 0);
+  eq(eventsNamed(w, 'license_polar_limited').map((e) => e.op), ['validate', 'validate', 'activate', 'validate', 'deactivate'], 'each grace reuse also logs the skipped validate');
+});
+
+test('revocation: a Polar 404 for a key with a cached valid verdict replaces the shared copy, so no isolate\'s grace path revives it (deny)', async () => {
+  const w = createWorld();
+  const ops = countKvOps(w);
+  eq((await w.send('/v1/license')).status, 200);
+  eq(ops.puts, 1);
+  w.clock.t += 601 * 1000;
+  w.responders.validate = () => jsonResponse(notFound('License key not found'), 404);
+  eq((await w.send('/v1/license')).status, 401);
+  eq(ops.puts, 2, 'one bounded write records the refusal');
+  ok(eventsNamed(w, 'license_revoked_cached').length === 1);
+  const stored = JSON.parse([...w.kv.store.entries()].find(([k]) => k.startsWith('lic:'))[1].value);
+  eq(stored.valid, false);
+  resetQuotaMemory(); // another isolate, with Polar down
+  w.clock.t += 601 * 1000;
+  w.responders.validate = () => jsonResponse({}, 500);
+  const res = await w.send('/v1/license');
+  eq(res.status, 503, 'the grace path refuses the revoked key');
+  eq(eventsNamed(w, 'license_grace_reuse').length, 0);
+  w.clock.t += 601 * 1000;
+  w.responders.validate = () => jsonResponse(notFound('License key not found'), 404);
+  eq((await w.send('/v1/license')).status, 401);
+  eq(ops.puts, 2, 'a key already recorded as refused costs no further write');
+});
+
 test('benefit filter: listed benefit allowed, unlisted rejected', async () => {
   let w = createWorld({ POLAR_BENEFIT_IDS: 'benefit-100, ' + BENEFIT_ID });
   eq((await w.send('/v1/license')).status, 200);
@@ -704,6 +759,40 @@ test('quote: 413 over 1 MB, 400 for non-array or invalid JSON', async () => {
   eq(w.calls.filter((c) => c.url.startsWith(PRICING)).length, 0);
 });
 
+// A chunked body (no content-length) delivered as 64 KB pieces; `total` chunks, or endless.
+function chunkedQuoteRequest(total = Infinity) {
+  const stats = { pulled: 0, cancelled: false };
+  const piece = new TextEncoder().encode(' '.repeat(64 * 1024));
+  const body = new ReadableStream({
+    pull(controller) {
+      if (stats.pulled === 0) controller.enqueue(new TextEncoder().encode('[{"productId":1}'));
+      if (stats.pulled >= total) { controller.enqueue(new TextEncoder().encode(']')); controller.close(); return; }
+      stats.pulled += 1;
+      controller.enqueue(piece);
+    },
+    cancel() { stats.cancelled = true; },
+  });
+  const request = new Request('https://gateway.test/pricing/v1/prices/quote', {
+    method: 'POST', headers: { authorization: 'Bearer ' + KEY, 'x-instance-id': INSTANCE, 'content-type': 'application/json' }, body, duplex: 'half',
+  });
+  return { request, stats };
+}
+
+test('chunked bodies: under the cap are forwarded whole (allow); over it are 413 without being read to the end (deny)', async () => {
+  const w = createWorld();
+  const small = chunkedQuoteRequest(3);
+  eq(small.request.headers.get('content-length'), null, 'no declared length');
+  let res = await handle(small.request, w.env, w.deps);
+  eq(res.status, 200);
+  eq(JSON.parse(lastUpstream(w, PRICING).body), [{ productId: 1 }]);
+  const endless = chunkedQuoteRequest();
+  res = await handle(endless.request, w.env, w.deps);
+  eq([res.status, await readJson(res)], [413, { error: 'payload_too_large' }]);
+  ok(endless.stats.pulled <= 18, 'stopped just past 1 MB, pulled ' + endless.stats.pulled);
+  eq(endless.stats.cancelled, true, 'the rest of the stream was cancelled');
+  ok(w.logs.some(([event, fields]) => event === 'request_rejected' && fields.reason === 'payload_too_large'));
+});
+
 test('products: GET preserves the query string and uses the catalog token', async () => {
   const w = createWorld();
   const res = await w.send('/v1/products/12345?include=prices&lang=en', { headers: { accept: 'application/json' } });
@@ -842,8 +931,11 @@ test('CORS: preflight is 204 without auth or upstream calls', async () => {
   eq(w.calls.length, 0);
 });
 
-test('activate: success returns instance details and seeds the verdict cache', async () => {
+test('activate: success returns instance details and seeds the verdict cache (memory and edge, never KV)', async () => {
   const w = createWorld();
+  const edge = createFakeCache(w.clock);
+  globalThis.caches = { default: edge };
+  try {
   w.responders.activate = () => jsonResponse(activateBody({ limit: 3, expiresAt: '2027-01-01T00:00:00.000000Z' }));
   const res = await w.send('/v1/license/activate', { method: 'POST', key: null, instance: null, body: { licenseKey: KEY, instanceName: 'laptop' } });
   eq(res.status, 200);
@@ -860,12 +952,37 @@ test('activate: success returns instance details and seeds the verdict cache', a
   eq(call.headers.accept, 'application/json');
   ok(call.headers['content-type'].startsWith('application/json'));
   eq(JSON.parse(call.body), { key: KEY, organization_id: ORG_ID, label: 'laptop' });
-  const seeded = [...w.kv.store.keys()].filter((k) => k.startsWith('lic:'));
+  eq([...w.kv.store.keys()].filter((k) => k.startsWith('lic:')).length, 0, 'activate spends no KV write');
+  const seeded = [...edge.store.keys()].filter((k) => k.includes('lic:'));
   eq(seeded.length, 1);
   ok(!seeded[0].includes(KEY), 'cache key never contains the license key');
-  eq(w.kv.ttls.get(seeded[0]), 86400);
+  eq(edge.store.get(seeded[0]).expiresAt, w.clock.t + 86400 * 1000);
   eq((await w.send('/v1/license')).status, 200);
   eq(w.polarCalls('validate').length, 0, 'first authed request uses the seeded verdict');
+  resetQuotaMemory(); // a fresh isolate in the same colo finds it in the edge cache
+  eq((await w.send('/v1/license')).status, 200);
+  eq(w.polarCalls('validate').length, 0, 'a fresh isolate uses the edge copy');
+  } finally {
+    delete globalThis.caches;
+  }
+});
+
+test('activate/deactivate cycling by a valid key spends no KV writes (deny), while a validate still persists to KV (allow)', async () => {
+  const w = createWorld();
+  const ops = countKvOps(w);
+  let deletes = 0;
+  const del = w.kv.delete;
+  w.kv.delete = async (...args) => { deletes += 1; return del(...args); };
+  for (let i = 0; i < 5; i += 1) {
+    eq((await w.send('/v1/license/activate', { method: 'POST', key: null, instance: null, body: { licenseKey: KEY, instanceName: 'laptop' } })).status, 200);
+    eq((await w.send('/v1/license/deactivate', { method: 'POST' })).status, 200);
+  }
+  eq([ops.puts, deletes], [0, 0], 'no KV write or delete across five cycles');
+  resetQuotaMemory();
+  eq((await w.send('/v1/license')).status, 200);
+  eq(ops.puts, 1, 'an uncached validate writes its verdict to KV');
+  eq((await w.send('/v1/license/deactivate', { method: 'POST' })).status, 200);
+  eq(deletes, 1, 'deactivate deletes the KV copy only when one exists');
 });
 
 test('activate: 403 limit is 409, revoked 402, other 403 and 404 are 401, bad body 400, outage 503', async () => {
@@ -1008,8 +1125,8 @@ test('activate: response carries tier (string or null)', async () => {
   let res = await post(w);
   eq(res.status, 200);
   eq((await readJson(res)).tier, 'pro');
-  const cacheKey = [...w.kv.store.keys()].find((k) => k.startsWith('lic:'));
-  eq(JSON.parse(w.kv.store.get(cacheKey).value).tier, 'pro', 'the seeded verdict carries the tier');
+  eq((await readJson(await w.send('/v1/license'))).tier, 'pro', 'the seeded verdict carries the tier');
+  eq(w.polarCalls('validate').length, 0);
   w = createWorld();
   res = await post(w);
   eq((await readJson(res)).tier, null);
@@ -1120,6 +1237,11 @@ function fakeRateLimiter(limit) {
 }
 
 const lastUpstream = (w, origin) => w.calls.filter((c) => c.url.startsWith(origin)).at(-1);
+
+test('routes: tag-key segments allow encoded catalog keys (allow) but no encoded slash, backslash, dot or control, and no leading dot (deny)', async () => {
+  for (const key of ['mew%7C25', 'Farfetch%27d%7C1', 'pikachu%7C25a', 'a.b_c-d%7C1', '100%25%7C1']) eq(matchPath('/catalog/v1/tags/' + key)?.routes[0].id, 'catalog:tags.write', key);
+  for (const key of ['a%2f..%2f..%2fadmin', 'a%2Fb', '%2e%2e', '..', '.hidden', 'a%5cb', 'a%00b', 'a%7fb', 'a b', 'a%2', 'x'.repeat(201)]) eq(matchPath('/catalog/v1/tags/' + key), null, key);
+});
 
 test('routes: namespaced paths resolve to service routes; unknown and traversal paths do not', async () => {
   eq(matchPath('/pricing/v1/prices/quote').routes[0].id, 'pricing:quote');
@@ -1462,6 +1584,7 @@ function createFakeCache(clock) {
       }
       return new Response(entry.body.slice(0), { status: 200, headers: entry.headers });
     },
+    async delete(url) { return store.delete(String(url)); },
     async put(url, response) {
       const maxAge = Number(/max-age=(\d+)/.exec(response.headers.get('cache-control') || '')?.[1] ?? 0);
       store.set(String(url), { body: await response.arrayBuffer(), headers: Object.fromEntries(response.headers), expiresAt: clock.t + maxAge * 1000 });
@@ -1710,15 +1833,58 @@ test('public policy: reads only, quote forced to fill none and capped at 100, no
   eq([res.status, await readJson(res)], [413, { error: 'batch_too_large', max: 100 }]);
 });
 
-test('public calls are per-IP limited by the session binding, keyed by IP not token', async () => {
+test('public calls are per-IP limited by the session binding (allow, deny, another IP allowed)', async () => {
   const limiter = fakeRateLimiter(2);
   const w = createPublicWorld({ RATE_LIMIT_SESSION: limiter });
   const token = await w.issue();
   eq((await w.publicSend('/pricing/v1/games', token, { ip: '3.3.3.3' })).status, 200);
   eq((await w.publicSend('/pricing/v1/games', token, { ip: '3.3.3.3' })).status, 200);
   eq((await w.publicSend('/pricing/v1/games', token, { ip: '3.3.3.3' })).status, 429);
-  eq((await w.publicSend('/pricing/v1/games', token, { ip: '4.4.4.4' })).status, 200);
-  eq(limiter.keys, ['ip:3.3.3.3', 'ip:3.3.3.3', 'ip:3.3.3.3', 'ip:4.4.4.4']);
+  eq((await w.publicSend('/pricing/v1/games', (w.clock.t += 1000, await w.issue(SITE, '4.4.4.4')), { ip: '4.4.4.4' })).status, 200);
+  eq(limiter.keys.filter((k) => k.startsWith('ip:')), ['ip:3.3.3.3', 'ip:3.3.3.3', 'ip:3.3.3.3', 'ip:4.4.4.4']);
+});
+
+test('public calls are also limited per session token: one token rotating IPs is refused (deny), separate tokens are not (allow)', async () => {
+  const limiter = fakeRateLimiter(2);
+  const w = createPublicWorld({ RATE_LIMIT_SESSION: limiter });
+  const token = await w.issue();
+  eq((await w.publicSend('/pricing/v1/games', token, { ip: '5.0.0.1' })).status, 200);
+  eq((await w.publicSend('/pricing/v1/games', token, { ip: '5.0.0.2' })).status, 200);
+  const res = await w.publicSend('/pricing/v1/games', token, { ip: '5.0.0.3' });
+  eq([res.status, res.headers.get('retry-after')], [429, '60']);
+  const event = eventsNamed(w, 'rate_limited').at(-1);
+  eq([event.subjectKind, event.subject.length, event.limiter], ['session', 16, 'RATE_LIMIT_SESSION']);
+  const sessionKeys = limiter.keys.filter((k) => k.startsWith('session:'));
+  eq(new Set(sessionKeys).size, 1);
+  ok(!sessionKeys[0].includes(token) && !JSON.stringify(w.logs).includes(token), 'the token itself is never a key or logged');
+  eq((await w.publicSend('/pricing/v1/games', (w.clock.t += 1000, await w.issue(SITE, '5.0.0.4')), { ip: '5.0.0.4' })).status, 200, 'a different token is its own budget');
+});
+
+test('ipLimiterKey: IPv4 as is; IPv6 on its /64 in every spelling; mapped IPv4 as IPv4', async () => {
+  eq(ipLimiterKey('9.9.9.9'), 'ip:9.9.9.9');
+  eq(ipLimiterKey('unknown'), 'ip:unknown');
+  const prefix = 'ip:2001:db8:aa:bb::/64';
+  for (const ip of ['2001:db8:aa:bb::1', '2001:0db8:00aa:00bb:ffff:1:2:3', '2001:DB8:AA:BB:0:0:0:9', '2001:db8:aa:bb:1::', '2001:db8:aa:bb::1.2.3.4', '2001:db8:aa:bb::1%eth0']) eq(ipLimiterKey(ip), prefix, ip);
+  eq(ipLimiterKey('2001:db8:aa:bc::1'), 'ip:2001:db8:aa:bc::/64', 'a different /64 is a different key');
+  eq(ipLimiterKey('2001:db8::1'), 'ip:2001:db8:0:0::/64');
+  eq(ipLimiterKey('::1'), 'ip:0:0:0:0::/64');
+  eq(ipLimiterKey('::ffff:1.2.3.4'), 'ip:1.2.3.4');
+  for (const bad of ['1::2::3', '2001:db8:1:2:3:4:5:6:7', 'gggg::1', '1:2:3:4:5:6:7']) eq(ipLimiterKey(bad), 'ip:' + bad, 'unparsable is verbatim: ' + bad);
+});
+
+test('per-IP limits key IPv6 on the /64: rotating within it is refused (deny), another /64 is not (allow)', async () => {
+  const limiter = fakeRateLimiter(2);
+  const w = createWorld({ RATE_LIMIT_PUBLIC: limiter });
+  const health = (ip) => w.send('/v1/health', { key: null, instance: null, headers: { 'cf-connecting-ip': ip } });
+  eq((await health('2001:db8:1:2::a')).status, 200);
+  eq((await health('2001:db8:1:2::b')).status, 200);
+  eq((await health('2001:db8:1:2:ffff::c')).status, 429);
+  eq((await health('2001:db8:1:3::a')).status, 200);
+  const attempts = fakeRateLimiter(1);
+  const lic = createWorld({ RATE_LIMIT_LICENSE_ATTEMPTS: attempts });
+  eq((await lic.send('/v1/license', { key: 'random-key-a', headers: { 'cf-connecting-ip': '2001:db8:9:9::1' } })).status, 200);
+  eq((await lic.send('/v1/license', { key: 'random-key-b', headers: { 'cf-connecting-ip': '2001:db8:9:9::2' } })).status, 429, 'the licence flood guard shares the /64 key');
+  eq(attempts.keys, ['ip:2001:db8:9:9::/64', 'ip:2001:db8:9:9::/64']);
 });
 
 test('edge cache: repeated public GETs reach the origin once, until the TTL runs out', async () => {
@@ -1812,13 +1978,15 @@ test('quote cache: items are cached one by one; only misses reach pricing; order
   const C = { skuId: 555 };
   let res = await quote([A, B]);
   eq(res.headers.get('x-gateway-cache'), 'miss');
-  res = await quote([B, C, { ...A, condition: 'near mint' }]);
+  res = await quote([B, C, A]);
   eq(res.headers.get('x-gateway-cache'), 'partial');
   eq((await readJson(res)).data.map((q) => [q.productId, q.skuId]), [[2, null], [null, 555], [1, null]]);
-  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), [C], 'only the miss was forwarded (condition matched case-insensitively)');
+  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), [C], 'only the miss was forwarded');
   res = await quote([C, A, B]);
   eq(res.headers.get('x-gateway-cache'), 'hit');
   eq(w.originCalls(PRICING).length, 2, 'an all-hit batch never reaches pricing');
+  res = await quote([{ ...A, condition: 'near mint' }]);
+  eq(res.headers.get('x-gateway-cache'), 'miss', 'selectors are keyed exactly as pricing receives them (no case folding)');
   w.clock.t += 3601 * 1000;
   const fresh = await w.issue();
   res = await w.publicSend('/pricing/v1/prices/quote', fresh, { method: 'POST', body: [A] });
@@ -1841,6 +2009,51 @@ test('quote cache: unusual items always go to pricing; a short or failed answer 
   res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: [{ productId: 7 }] });
   eq(res.status, 400, 'a pricing 4xx passes through');
   eq(w.cache.store.size, 0);
+});
+
+// Pricing's real semantics (cascade.js): game is String(it.game) matched exactly; "" or absent
+// means pokemon. So " " and "POKEMON" are different questions with a null answer.
+function pricingLikeQuote(w) {
+  w.responders.pricing = (call) => {
+    const items = JSON.parse(call.body);
+    return jsonResponse({ data: items.map((it) => {
+      const game = (it.game != null ? String(it.game) : '') || 'pokemon';
+      return { productId: it.productId ?? null, game, market: ['pokemon', 'pokemon-japan'].includes(game) ? 12.34 : null };
+    }) });
+  };
+}
+
+test('quote cache poisoning (regression): a non-canonical game never answers the canonical question', async () => {
+  const w = createPublicWorld();
+  pricingLikeQuote(w);
+  const token = await w.issue();
+  const quote = (items) => w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: items });
+  await quote([{ productId: 42, game: ' ' }]);
+  let res = await quote([{ productId: 42 }]);
+  eq([res.headers.get('x-gateway-cache'), (await readJson(res)).data[0].market], ['miss', 12.34], 'whitespace game did not poison the absent-game key');
+  await quote([{ productId: 43, game: 'POKEMON' }]);
+  res = await quote([{ productId: 43, game: 'pokemon' }]);
+  eq([res.headers.get('x-gateway-cache'), (await readJson(res)).data[0].market], ['miss', 12.34], 'upper-case game did not poison the canonical key');
+});
+
+test('quote cache: canonical items are cached (allow); non-canonical selectors and priceless answers are not (deny)', async () => {
+  const w = createPublicWorld();
+  pricingLikeQuote(w);
+  const token = await w.issue();
+  const quote = (items) => w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: items });
+  const canonical = [{ productId: 1, game: 'pokemon' }, { productId: 2, condition: 'Near Mint', printing: 'Reverse Holofoil' }, { skuId: 3, game: 'pokemon-japan' }];
+  await quote(canonical);
+  eq((await quote(canonical)).headers.get('x-gateway-cache'), 'hit');
+  const before = w.originCalls(PRICING).length;
+  const odd = [{ productId: 1, game: 'Pokemon' }, { productId: 1, game: '' }, { productId: 1, condition: ' Near Mint' }, { productId: 1, printing: 'Holo\u0000' }, { productId: 1, condition: 'Near  Mint' }];
+  await quote(odd);
+  await quote(odd);
+  eq(w.originCalls(PRICING).length, before + 2, 'non-canonical items reach pricing every time');
+  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), odd, 'and are forwarded verbatim');
+  const size = w.cache.store.size;
+  await quote([{ productId: 9, game: 'onepiececardgame' }]); // canonical, but pricing has no price
+  eq(w.cache.store.size, size, 'an answer with market null is never stored');
+  eq((await quote([{ productId: 9, game: 'onepiececardgame' }])).headers.get('x-gateway-cache'), 'miss');
 });
 
 test('CORS: site origins match exactly, extension schemes by prefix', async () => {

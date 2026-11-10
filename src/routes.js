@@ -10,6 +10,10 @@
 // One path segment naming a file: no slashes, no leading dot (so never "." or "..").
 const FILE = '[A-Za-z0-9][A-Za-z0-9._-]{0,199}';
 const DIGITS = '\\d{1,12}';
+// One tag-key segment: the <file> characters plus percent-escapes, since catalog keys are
+// "name|number" sent URL-encoded ("mew%7C25"). No leading dot, and no escape that decodes to
+// "/", "\", "." or a control character, so it can never become a path or a traversal.
+const TAG_KEY = '(?!\\.)(?:[A-Za-z0-9._-]|%(?!2[EeFf]|5[Cc]|[01][0-9A-Fa-f]|7[Ff])[0-9A-Fa-f]{2}){1,200}';
 
 const route = (id, method, service, pattern) => Object.freeze({ id, method, service, pattern: new RegExp('^' + pattern + '$') });
 
@@ -39,7 +43,7 @@ export const SERVICE_ROUTES = Object.freeze([
   route('catalog:products.lookup', 'POST', 'catalog', '/v1/products:lookup'),
   route('catalog:games', 'GET', 'catalog', '/v1/games'),
   route('catalog:tags', 'GET', 'catalog', '/v1/tags'),
-  route('catalog:tags.write', 'POST', 'catalog', '/v1/tags/[^/]{1,200}'), // a write: granted to no client by default
+  route('catalog:tags.write', 'POST', 'catalog', `/v1/tags/${TAG_KEY}`), // a write: granted to no client by default
 ]);
 
 export const ROUTE_IDS = Object.freeze(new Set([...GATEWAY_ROUTES, ...SERVICE_ROUTES].map((r) => r.id)));
