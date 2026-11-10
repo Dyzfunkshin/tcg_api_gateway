@@ -10,7 +10,7 @@ check's name and HTTP status, never the token. Exit code 0 only if all pass.
 import sys
 
 from bitwarden_secrets import bitwarden_client, secret_value
-from cloudflare_api import ACCOUNT_ID, CLOUDFLARE_TOKEN_KEY, ZONE_NAME, CloudflareClient
+from cloudflare_api import ACCOUNT_ID, CLOUDFLARE_TOKEN_KEY, MINTUITION_ZONE_NAME, ZONE_NAME, CloudflareClient
 
 LICENSES_KV_ID = "3216419ee1244988a05fc0bad9d7b17c"
 
@@ -53,6 +53,14 @@ def main() -> int:
     else:
         failures += 2
         print("skip Workers Routes / DNS checks: zone not readable")
+
+    mint = check(f"Zone: Read ({MINTUITION_ZONE_NAME}, this account)", f"/zones?name={MINTUITION_ZONE_NAME}",
+                 lambda b: (len(b["result"]) == 1 and b["result"][0]["account"]["id"] == ACCOUNT_ID, "zone missing or in another account"))
+    if mint:
+        check(f"Workers Routes ({MINTUITION_ZONE_NAME})", f"/zones/{mint['result'][0]['id']}/workers/routes")
+    else:
+        failures += 1
+        print(f"skip Workers Routes ({MINTUITION_ZONE_NAME}): zone not readable")
 
     print("all checks passed" if failures == 0 else f"{failures} check(s) failed")
     return 0 if failures == 0 else 1
