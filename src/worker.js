@@ -201,7 +201,7 @@ function memoryRememberVerdict(cacheKey, verdict) {
 // Returns a 429 response when over the limit, else null. Binding absent = allowed;
 // a binding error fails open (bindingAllows logs it).
 async function licenseAttemptBlocked(ip, logTag, env, deps) {
-  const allowed = await bindingAllows(env, 'RATE_LIMIT_LICENSE_ATTEMPTS', 'ip:' + ip, deps);
+  const allowed = await bindingAllows(env, 'RATE_LIMIT_LICENSE_ATTEMPTS', ipLimiterKey(ip), deps);
   if (allowed !== false) return null;
   deps.log('license_attempts_limited', { ip, key: logTag });
   return errorResponse(429, 'license_attempts_exceeded', {}, { 'Retry-After': '60' });
@@ -782,7 +782,8 @@ async function identifySession(token, request, env, deps) {
   if (!client) return invalid('unknown client ' + session.clientId);
   const origin = request.headers.get('origin');
   if (origin !== session.origin || !client.origins.includes(origin)) return invalid('origin mismatch');
-  return { client, subject: null };
+  // A token is limited on its own too (the IP alone can rotate); keyed and logged by a hash prefix, never the token.
+  return { client, subject: null, sessionTag: (await sha256Hex(token)).slice(0, 16) };
 }
 
 // ---------- callers ----------
@@ -822,6 +823,48 @@ async function identifyCaller(request, env, deps) {
 
 const callerIp = (request) => request.headers.get('cf-connecting-ip') || 'unknown';
 
+// The rate-limiter key for a caller's IP. IPv4 is keyed as is; IPv6 on its /64, since one
+// subscriber usually holds a whole /64 and could otherwise rotate past every per-IP limit.
+// An IPv4-mapped IPv6 address is keyed as its IPv4. Anything unparsable is keyed verbatim.
+export function ipLimiterKey(ip) {
+  const raw = String(ip ?? '').trim().toLowerCase();
+  if (!raw.includes(':')) return 'ip:' + raw;
+  const groups = ipv6Groups(raw.replace(/%.*$/, ''));
+  if (!groups) return 'ip:' + raw.slice(0, 64);
+  if (groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff) {
+    return 'ip:' + [groups[6] >> 8, groups[6] & 255, groups[7] >> 8, groups[7] & 255].join('.');
+  }
+  return 'ip:' + groups.slice(0, 4).map((g) => g.toString(16)).join(':') + '::/64';
+}
+
+// "2001:db8::1" -> eight 16-bit numbers, or null. Handles one "::" and a dotted IPv4 tail.
+function ipv6Groups(text) {
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const parse = (part) => {
+    if (part === '') return [];
+    const out = [];
+    for (const piece of part.split(':')) {
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(piece)) {
+        const octets = piece.split('.').map(Number);
+        if (octets.some((o) => o > 255)) return null;
+        out.push((octets[0] << 8) | octets[1], (octets[2] << 8) | octets[3]);
+      } else if (/^[0-9a-f]{1,4}$/.test(piece)) {
+        out.push(Number.parseInt(piece, 16));
+      } else {
+        return null;
+      }
+    }
+    return out;
+  };
+  const head = parse(halves[0]);
+  const tail = halves.length === 2 ? parse(halves[1]) : [];
+  if (!head || !tail) return null;
+  if (halves.length === 1) return head.length === 8 ? head : null;
+  const missing = 8 - head.length - tail.length;
+  return missing >= 1 ? [...head, ...new Array(missing).fill(0), ...tail] : null;
+}
+
 // ---------- routing ----------
 
 async function route(request, env, deps) {
@@ -851,12 +894,16 @@ async function route(request, env, deps) {
     return errorResponse(403, 'forbidden');
   }
 
-  // 4. Quota. Anonymous and public-session callers are limited per IP (binding only);
-  // licences and app keys per credential, with a daily KV quota.
+  // 4. Quota. Anonymous and public-session callers are limited per IP (an IPv6 /64; binding
+  // only), public sessions also per token; licences and app keys per credential, with a
+  // daily KV quota.
   let quota = null;
   if (client.auth === 'none' || client.auth === 'public-session') {
-    const allowed = await bindingAllows(env, client.quota.perMinuteBinding, 'ip:' + callerIp(request), deps);
-    if (allowed === false) return minuteExceeded(deps.now(), 60, deps, { client: client.id, route: route.id, limiter: client.quota.perMinuteBinding, subjectKind: 'ip', subject: callerIp(request), ip: callerIp(request) });
+    const binding = client.quota.perMinuteBinding;
+    const ipKey = ipLimiterKey(callerIp(request));
+    const refuse = (subjectKind, subject) => minuteExceeded(deps.now(), 60, deps, { client: client.id, route: route.id, limiter: binding, subjectKind, subject, ip: callerIp(request) });
+    if ((await bindingAllows(env, binding, ipKey, deps)) === false) return refuse('ip', ipKey.slice(3));
+    if (caller.sessionTag && (await bindingAllows(env, binding, 'session:' + caller.sessionTag, deps)) === false) return refuse('session', caller.sessionTag);
   } else {
     const isApp = String(caller.subject).startsWith('app:');
     quota = await applyQuota(caller.subject, quotaLimitsFor(client, env), env, deps, {

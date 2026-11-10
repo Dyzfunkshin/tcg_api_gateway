@@ -1,7 +1,7 @@
 // Sourcery gateway tests. Plain node:assert, no dependencies.
 // Run: node gateway/test/run.js   (exits non-zero on any failure)
 import assert from 'node:assert/strict';
-import { handle, licenseKeyFrom, corsHeaders, corsOriginsOf, quotaKeys, resetQuotaMemory } from '../src/worker.js';
+import { handle, licenseKeyFrom, corsHeaders, corsOriginsOf, quotaKeys, resetQuotaMemory, ipLimiterKey } from '../src/worker.js';
 import { DEFAULT_CLIENTS, LICENSE_CLIENT, ANONYMOUS_CLIENT, assertValidClients } from '../src/clients.js';
 import { matchPath } from '../src/routes.js';
 
@@ -1744,15 +1744,58 @@ test('public policy: reads only, quote forced to fill none and capped at 100, no
   eq([res.status, await readJson(res)], [413, { error: 'batch_too_large', max: 100 }]);
 });
 
-test('public calls are per-IP limited by the session binding, keyed by IP not token', async () => {
+test('public calls are per-IP limited by the session binding (allow, deny, another IP allowed)', async () => {
   const limiter = fakeRateLimiter(2);
   const w = createPublicWorld({ RATE_LIMIT_SESSION: limiter });
   const token = await w.issue();
   eq((await w.publicSend('/pricing/v1/games', token, { ip: '3.3.3.3' })).status, 200);
   eq((await w.publicSend('/pricing/v1/games', token, { ip: '3.3.3.3' })).status, 200);
   eq((await w.publicSend('/pricing/v1/games', token, { ip: '3.3.3.3' })).status, 429);
-  eq((await w.publicSend('/pricing/v1/games', token, { ip: '4.4.4.4' })).status, 200);
-  eq(limiter.keys, ['ip:3.3.3.3', 'ip:3.3.3.3', 'ip:3.3.3.3', 'ip:4.4.4.4']);
+  eq((await w.publicSend('/pricing/v1/games', (w.clock.t += 1000, await w.issue(SITE, '4.4.4.4')), { ip: '4.4.4.4' })).status, 200);
+  eq(limiter.keys.filter((k) => k.startsWith('ip:')), ['ip:3.3.3.3', 'ip:3.3.3.3', 'ip:3.3.3.3', 'ip:4.4.4.4']);
+});
+
+test('public calls are also limited per session token: one token rotating IPs is refused (deny), separate tokens are not (allow)', async () => {
+  const limiter = fakeRateLimiter(2);
+  const w = createPublicWorld({ RATE_LIMIT_SESSION: limiter });
+  const token = await w.issue();
+  eq((await w.publicSend('/pricing/v1/games', token, { ip: '5.0.0.1' })).status, 200);
+  eq((await w.publicSend('/pricing/v1/games', token, { ip: '5.0.0.2' })).status, 200);
+  const res = await w.publicSend('/pricing/v1/games', token, { ip: '5.0.0.3' });
+  eq([res.status, res.headers.get('retry-after')], [429, '60']);
+  const event = eventsNamed(w, 'rate_limited').at(-1);
+  eq([event.subjectKind, event.subject.length, event.limiter], ['session', 16, 'RATE_LIMIT_SESSION']);
+  const sessionKeys = limiter.keys.filter((k) => k.startsWith('session:'));
+  eq(new Set(sessionKeys).size, 1);
+  ok(!sessionKeys[0].includes(token) && !JSON.stringify(w.logs).includes(token), 'the token itself is never a key or logged');
+  eq((await w.publicSend('/pricing/v1/games', (w.clock.t += 1000, await w.issue(SITE, '5.0.0.4')), { ip: '5.0.0.4' })).status, 200, 'a different token is its own budget');
+});
+
+test('ipLimiterKey: IPv4 as is; IPv6 on its /64 in every spelling; mapped IPv4 as IPv4', async () => {
+  eq(ipLimiterKey('9.9.9.9'), 'ip:9.9.9.9');
+  eq(ipLimiterKey('unknown'), 'ip:unknown');
+  const prefix = 'ip:2001:db8:aa:bb::/64';
+  for (const ip of ['2001:db8:aa:bb::1', '2001:0db8:00aa:00bb:ffff:1:2:3', '2001:DB8:AA:BB:0:0:0:9', '2001:db8:aa:bb:1::', '2001:db8:aa:bb::1.2.3.4', '2001:db8:aa:bb::1%eth0']) eq(ipLimiterKey(ip), prefix, ip);
+  eq(ipLimiterKey('2001:db8:aa:bc::1'), 'ip:2001:db8:aa:bc::/64', 'a different /64 is a different key');
+  eq(ipLimiterKey('2001:db8::1'), 'ip:2001:db8:0:0::/64');
+  eq(ipLimiterKey('::1'), 'ip:0:0:0:0::/64');
+  eq(ipLimiterKey('::ffff:1.2.3.4'), 'ip:1.2.3.4');
+  for (const bad of ['1::2::3', '2001:db8:1:2:3:4:5:6:7', 'gggg::1', '1:2:3:4:5:6:7']) eq(ipLimiterKey(bad), 'ip:' + bad, 'unparsable is verbatim: ' + bad);
+});
+
+test('per-IP limits key IPv6 on the /64: rotating within it is refused (deny), another /64 is not (allow)', async () => {
+  const limiter = fakeRateLimiter(2);
+  const w = createWorld({ RATE_LIMIT_PUBLIC: limiter });
+  const health = (ip) => w.send('/v1/health', { key: null, instance: null, headers: { 'cf-connecting-ip': ip } });
+  eq((await health('2001:db8:1:2::a')).status, 200);
+  eq((await health('2001:db8:1:2::b')).status, 200);
+  eq((await health('2001:db8:1:2:ffff::c')).status, 429);
+  eq((await health('2001:db8:1:3::a')).status, 200);
+  const attempts = fakeRateLimiter(1);
+  const lic = createWorld({ RATE_LIMIT_LICENSE_ATTEMPTS: attempts });
+  eq((await lic.send('/v1/license', { key: 'random-key-a', headers: { 'cf-connecting-ip': '2001:db8:9:9::1' } })).status, 200);
+  eq((await lic.send('/v1/license', { key: 'random-key-b', headers: { 'cf-connecting-ip': '2001:db8:9:9::2' } })).status, 429, 'the licence flood guard shares the /64 key');
+  eq(attempts.keys, ['ip:2001:db8:9:9::/64', 'ip:2001:db8:9:9::/64']);
 });
 
 test('edge cache: repeated public GETs reach the origin once, until the TTL runs out', async () => {
