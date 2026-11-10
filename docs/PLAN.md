@@ -6,8 +6,8 @@ the gateway half of G2 (`/pricing/v1/health` open), the Worker half of G4
 (Access service-token headers) and the Worker half of G5 (sessions; its edge
 and quote caches were later removed, decision 26), each on its own `feature/g<n>-…` branch, all merged
 into `dev`. The Cloudflare token `tcg-api-gateway` has its permissions and is
-in Bitwarden (`api-gateway`); deploys need the `owner-ops` machine token on the
-PC. Still outside code: G2's alert repoint (after deploy), G4's Zero Trust
+in Bitwarden (`api-gateway`); deploys use the `gateway-deploy` machine token on
+the PC (section 7). Still outside code: G2's alert repoint (after deploy), G4's Zero Trust
 setup, G5's Turnstile widget and the two G5 secrets.
 **Owner repo:** `_services/tcg_api_gateway` (this repo).
 **Replaces:** `_apps/sourcery/gateway` (the Sourcery-only Worker at `api.dyzzyscards.com`).
@@ -276,10 +276,14 @@ only, never values. Run it after creating or rotating a secret. The G3/G4
 Cloudflare steps are `tools/cutover.py`; both share `tools/cloudflare_api.py`,
 print a plan unless given `--apply`, and are tested offline by
 `tools/test_tools.py`. Pushes
-run as the owner, so use the `owner-ops` machine token (read/write on every
-project; Windows Credential Manager entry `owner-ops/bitwarden-machine-token`,
-read with `tcg_catalog_service/tools/machine_token.py --target
-owner-ops/bitwarden-machine-token`), never a token mounted into a service.
+run on the owner's PC as the narrow `gateway-deploy` machine account (owner,
+2026-11-10): **Can read** on `api-gateway` and `hosted-api` only. Windows
+Credential Manager entry `gateway-deploy/bitwarden-machine-token`, read with
+`tcg_catalog_service/tools/machine_token.py`. It never holds standing write: the
+owner grants **write on `api-gateway`** for the G3 cut-over (it stores the Access
+service token halves) or a key rotation, then removes it. `owner-ops` (read/write
+on every project) is not used by the gateway tools, and its token is not kept on
+the PC. Never use a token mounted into a service.
 
 | Worker secret | Purpose | Bitwarden secret (project) | Exists? |
 |---|---|---|---|
@@ -296,7 +300,7 @@ the Worker):
 | Credential | Bitwarden | Exists? |
 |---|---|---|
 | Cloudflare API token | `TCG_GATEWAY_CLOUDFLARE_API_TOKEN` (`api-gateway`); dashboard name `tcg-api-gateway` | **Yes.** Dedicated token, client-IP filtered to the owner's PC (2026-11-09). `tools/check_cloudflare_token.py` passed all 10 read-only checks on 2026-11-09 (Workers Scripts, KV `LICENSES`, Access apps + service tokens, Turnstile, zone `dyzzyscards.com`, Workers Routes, DNS). If the owner's IP changes, update the token's IP filter. The old `sourcery_cloudflare_api_token` stays tunnel-only and is not used by the gateway tools. |
-| Bitwarden machine token (PC) | n/a (`owner-ops`, Credential Manager, above) | **Yes** (stored 2026-11-09). `owner-ops` is **Can read, write** on every project, so creating the `api-gateway` secrets needs no temporary permission change. |
+| Bitwarden machine token (PC) | n/a (`gateway-deploy`, Credential Manager, above) | **Yes** (2026-11-10). Read on `api-gateway` + `hosted-api`; write on `api-gateway` only while granted for G3 or a rotation. |
 
 Unchanged and not the gateway's concern: `JUSTTCG_API_KEY`
 (`139c13f6-…`, project `pricing-runtime`), used only by pricing;
@@ -320,8 +324,9 @@ every live session at once. That is acceptable: tokens last 30 minutes
 - **How:** generate a new random value of at least 32 bytes inside the tooling
   so it is never displayed. Store it in Bitwarden project `api-gateway` as
   `TCG_GATEWAY_SESSION_SIGNING_KEY`, replacing the old value. Then push it as
-  the Worker secret `SESSION_SIGNING_KEY` with `tools/push_secrets.py`, as
-  owner via `owner-ops` (as above).
+  the Worker secret `SESSION_SIGNING_KEY` with `tools/push_secrets.py
+  --apply --generate-session-key --only SESSION_SIGNING_KEY`, as `gateway-deploy`
+  with write on `api-gateway` granted for the rotation, then removed.
 - **Expected effect:** each active visitor gets one 401 and silently re-issues
   a session.
 

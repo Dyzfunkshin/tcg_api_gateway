@@ -27,7 +27,7 @@ npm test        # offline; must stay offline and dependency-free
 python tools/test_tools.py   # offline tests of the operator tools below
 ```
 
-Operator tools (Python 3.11+, stdlib + `bitwarden-sdk`; run as owner via `owner-ops`).
+Operator tools (Python 3.11+, stdlib + `bitwarden-sdk`; run via the `gateway-deploy` Bitwarden machine account).
 Each prints its plan and contacts nothing unless given `--apply`:
 
 ```
