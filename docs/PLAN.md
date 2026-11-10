@@ -531,8 +531,11 @@ sections above):
     unadulterated." The gateway decides who gets in, which routes and how
     often (auth, policy, quotas, rate limits, body and batch caps, CORS,
     forced `x-fill-policy`), then forwards. It never caches, splits, merges
-    or rewrites a service response, and sets no `Cache-Control` or
-    `X-Gateway-Cache` of its own: the edge cache, the per-item quote cache and
+    or rewrites a service response body, and sets no `Cache-Control` or
+    `X-Gateway-Cache` of its own. Two deliberate exceptions, both to avoid
+    leaking origin internals: an origin 5xx becomes `502 origin_unavailable`,
+    and only `content-type`, `etag` and `cache-control` headers are passed back.
+    Otherwise: the edge cache, the per-item quote cache and
     the policy `cache` field are removed. Supersedes decisions 13 and 19. If
     origin load ever matters, the services set their own `Cache-Control` and
     Cloudflare caches on that; the gateway stays blind to it. Licence
