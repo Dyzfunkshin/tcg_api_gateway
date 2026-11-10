@@ -32,7 +32,6 @@ from push_secrets import API_GATEWAY_PROJECT_ID, SecretStoreError
 # (hostname, zone name), in cut-over order (PLAN.md section 11, decision 28).
 CUSTOM_DOMAINS = [("api.dyzzyscards.com", "dyzzyscards.com"), ("api.mintuition.app", "mintuition.app")]
 # Hosts that may be attached fresh when on no Worker (api.dyzzyscards.com must already exist).
-ATTACH_IF_UNATTACHED = {"api.mintuition.app"}
 OLD_WORKER = "sourcery-gateway"
 POLAR_PRODUCTION = "https://api.polar.sh"
 APP_TOKEN_SECRETS = ["PRICING_APP_TOKEN", "CATALOG_APP_TOKEN"]
@@ -114,10 +113,11 @@ def check_host(cloudflare, hostname: str, zone_name: str) -> dict:
         found = ", ".join(f"{r.get('pattern')} -> {r.get('script')}" for r in matching)
         raise CutoverStop(f"{hostname} is attached as a zone Worker route ({found}), not a Custom Domain; "
                           "this script only moves Custom Domains. Move it by hand or update the plan.")
-    if hostname in ATTACH_IF_UNATTACHED:
-        print(f"ok   {hostname} is attached to no Worker; will attach to {WORKER_NAME} in zone {zone_name}")
-        return {"hostname": hostname, "action": "attach", "record": None, "zone_id": zones[0]["id"]}
-    raise CutoverStop(f"{hostname} is not attached to any Worker; not guessing")
+    # Attached nowhere: attach. For api.mintuition.app that is the normal first state; for
+    # api.dyzzyscards.com it is the state an interrupted run leaves (detach done, attach not),
+    # and attaching to the new Worker is exactly the step that was missing.
+    print(f"ok   {hostname} is attached to no Worker; will attach to {WORKER_NAME} in zone {zone_name}")
+    return {"hostname": hostname, "action": "attach", "record": None, "zone_id": zones[0]["id"]}
 
 
 def preflight(cloudflare, variables: dict) -> list[dict]:
