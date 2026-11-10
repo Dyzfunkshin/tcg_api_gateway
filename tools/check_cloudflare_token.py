@@ -2,7 +2,7 @@
 
 Usage (from a venv with bitwarden-sdk):  python tools/check_cloudflare_token.py
 
-Reads TCG_GATEWAY_CLOUDFLARE_API_TOKEN from Bitwarden (owner-ops) and makes only
+Reads sourcery_cloudflare_api_token from Bitwarden (owner-ops) and makes only
 GET requests, one per permission the plan needs (PLAN.md section 7). Prints each
 check's name and HTTP status, never the token. Exit code 0 only if all pass.
 """

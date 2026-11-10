@@ -16,7 +16,7 @@ ACCOUNT_ID = "722b682d1c0bb958ea4d14b5bc6275d1"
 ZONE_NAME = "dyzzyscards.com"
 WORKER_NAME = "tcg-api-gateway"
 # Bitwarden key of the Cloudflare API token every operator tool uses (PLAN.md section 7).
-CLOUDFLARE_TOKEN_KEY = "TCG_GATEWAY_CLOUDFLARE_API_TOKEN"
+CLOUDFLARE_TOKEN_KEY = "sourcery_cloudflare_api_token"  # Bitwarden owner-ops, PLAN.md section 7
 
 
 class CloudflareError(Exception):
