@@ -10,7 +10,6 @@ import * as polar from './polar.js';
 import { matchPath } from './routes.js';
 import { DEFAULT_CLIENTS, isOpenRoute, originMatches } from './clients.js';
 import { issueSessionToken, readSessionToken, verifyTurnstile } from './session.js';
-import { cacheUrlForGet, cacheUrlForQuoteItem, isCacheableQuoteAnswer, cacheGet, cachePut, headersOf } from './edge-cache.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const INACTIVE_STATUSES = new Set(['expired', 'revoked', 'disabled']);
@@ -72,7 +71,7 @@ export function corsHeaders(origin, allowedOrigins) {
     Vary: 'Origin',
     'Access-Control-Allow-Headers': 'authorization, content-type, x-instance-id',
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Expose-Headers': 'X-Quota-Remaining, Retry-After, ETag, X-Gateway-Cache',
+    'Access-Control-Expose-Headers': 'X-Quota-Remaining, Retry-After, ETag',
   };
 }
 
@@ -627,11 +626,9 @@ function fillPolicyOf(caller, env) {
   return caller.client.fillPolicy;
 }
 
-// The games lists change rarely, so a response without its own cache header is kept an hour.
-const DEFAULT_CACHE_CONTROL = { 'pricing:games': 'private, max-age=3600' };
-
 // Forwards an allowed service route: path verbatim, query string preserved, only the
-// gateway's own headers added (PLAN.md 6.1 steps 6-7).
+// gateway's own headers added (PLAN.md 6.1 steps 6-7). The response is the service's own,
+// passed through unchanged: the gateway never caches, splits, merges or rewrites it.
 async function serviceRoute(request, url, route, upstreamPath, caller, env, deps) {
   const config = originConfig(env, route.service.toUpperCase());
   if (!config) return errorResponse(503, 'origin_not_configured');
@@ -645,8 +642,9 @@ async function serviceRoute(request, url, route, upstreamPath, caller, env, deps
     }
     body = read.text;
   }
-  let quoteItems = null;
   if (route.id === 'pricing:quote') {
+    // Parsed only to count the batch for the cap; the body is forwarded as received.
+    let quoteItems = null;
     try {
       quoteItems = JSON.parse(body);
     } catch {
@@ -669,74 +667,7 @@ async function serviceRoute(request, url, route, upstreamPath, caller, env, deps
   if (route.service === 'pricing') headers['x-fill-policy'] = fillPolicyOf(caller, env);
   const target = config.origin + upstreamPath + url.search;
 
-  // 5. Edge cache, for policies that allow it on this route (PLAN.md 6.3 point 5).
-  const ttlSeconds = caller.client.cache ? caller.client.cache[route.id] : undefined;
-  if (ttlSeconds && quoteItems) return cachedQuote(request, target, headers, quoteItems, ttlSeconds, deps);
-  if (ttlSeconds && request.method === 'GET') return cachedGet(request, target, headers, cacheUrlForGet(route.service, upstreamPath, url.search), ttlSeconds, deps);
-
-  const response = await forward(request, target, headers, body, deps);
-  const fallbackCacheControl = DEFAULT_CACHE_CONTROL[route.id];
-  if (fallbackCacheControl && response.ok && !response.headers.get('cache-control')) response.headers.set('cache-control', fallbackCacheControl);
-  return response;
-}
-
-// A GET answered from the edge cache, or forwarded and (on a 200) stored for ttlSeconds.
-async function cachedGet(request, target, headers, cacheUrl, ttlSeconds, deps) {
-  const hit = await cacheGet(deps.cache, cacheUrl, deps.log);
-  if (hit) {
-    return new Response(hit.body, { status: 200, headers: { ...headersOf(hit), 'cache-control': `public, max-age=${ttlSeconds}`, 'x-gateway-cache': 'hit' } });
-  }
-  const response = await forward(request, target, headers, undefined, deps);
-  if (response.status !== 200) return response;
-  const kept = headersOf(response);
-  // One branch to the client, one to the cache. The write is handed to waitUntil, not awaited:
-  // an unread tee branch would otherwise buffer the whole body in memory.
-  const [toClient, toCache] = response.body ? response.body.tee() : [null, null];
-  if (toCache) deps.waitUntil(cachePut(deps.cache, cacheUrl, toCache, kept, ttlSeconds, deps.log));
-  return new Response(toClient, { status: 200, headers: { ...kept, 'cache-control': `public, max-age=${ttlSeconds}`, 'x-gateway-cache': 'miss' } });
-}
-
-// A quote batch split per item: cached items are answered from the edge, only the misses
-// go to pricing (in order), and the answers are merged back into request order. Relies on
-// pricing's contract that `data` has the same order and length as the request.
-async function cachedQuote(request, target, headers, items, ttlSeconds, deps) {
-  const cacheUrls = items.map(cacheUrlForQuoteItem);
-  const answers = await Promise.all(
-    cacheUrls.map(async (cacheUrl) => {
-      if (!cacheUrl) return undefined;
-      const hit = await cacheGet(deps.cache, cacheUrl, deps.log);
-      if (!hit) return undefined;
-      try {
-        return await hit.json();
-      } catch {
-        return undefined;
-      }
-    }),
-  );
-  const missIndexes = answers.flatMap((answer, index) => (answer === undefined ? [index] : []));
-  const respond = (state) => jsonResponse(200, { data: answers }, { 'cache-control': 'no-store', 'x-gateway-cache': state });
-  if (missIndexes.length === 0) return respond(items.length === 0 ? 'miss' : 'hit');
-
-  const upstream = await forward(request, target, headers, JSON.stringify(missIndexes.map((index) => items[index])), deps);
-  if (upstream.status !== 200) return upstream;
-  let data = null;
-  try {
-    data = (await upstream.json()).data;
-  } catch {
-    data = null;
-  }
-  if (!Array.isArray(data) || data.length !== missIndexes.length) {
-    deps.log('quote_shape_mismatch', { sent: missIndexes.length, got: Array.isArray(data) ? data.length : null });
-    return errorResponse(502, 'origin_unavailable');
-  }
-  await Promise.all(
-    missIndexes.map((index, position) => {
-      answers[index] = data[position];
-      const cacheUrl = cacheUrls[index];
-      return cacheUrl && isCacheableQuoteAnswer(data[position]) ? cachePut(deps.cache, cacheUrl, JSON.stringify(data[position]), { 'content-type': 'application/json' }, ttlSeconds, deps.log) : null;
-    }),
-  );
-  return respond(missIndexes.length === items.length ? 'miss' : 'partial');
+  return forward(request, target, headers, body, deps);
 }
 
 // ---------- public sessions ----------
@@ -944,7 +875,7 @@ async function route(request, env, deps) {
     if (quota.response) return quota.response;
   }
 
-  // 5-7. Answer, or serve from the edge cache / forward (serviceRoute).
+  // 5-7. Answer, or forward (serviceRoute).
   let response;
   switch (route.id) {
     case 'gateway:health':
@@ -969,7 +900,7 @@ async function route(request, env, deps) {
   return response;
 }
 
-// deps: { fetch, now, log, clients, cache } are injectable for tests.
+// deps: { fetch, now, log, clients } are injectable for tests.
 export async function handle(request, env, deps = {}) {
   const resolved = {
     // The runtime fetch must not be called as a method of this object (Workers throws
@@ -978,9 +909,6 @@ export async function handle(request, env, deps = {}) {
     now: deps.now || Date.now,
     log: deps.log || ((event, fields) => console.log(JSON.stringify({ event, ...fields }))),
     clients: deps.clients || DEFAULT_CLIENTS,
-    cache: deps.cache !== undefined ? deps.cache : edgeCache(),
-    // Background work that outlives the response (cache writes). Errors are logged, never thrown.
-    waitUntil: deps.waitUntil || ((promise) => { Promise.resolve(promise).catch((error) => (deps.log || console.log)('background_failed', { error: String(error && error.message) })); }),
   };
   const cors = corsHeaders(request.headers.get('origin'), corsOriginsOf(resolved.clients));
 
@@ -1000,7 +928,7 @@ export async function handle(request, env, deps = {}) {
 }
 
 export default {
-  fetch(request, env, ctx) {
-    return handle(request, env, ctx && typeof ctx.waitUntil === 'function' ? { waitUntil: ctx.waitUntil.bind(ctx) } : {});
+  fetch(request, env) {
+    return handle(request, env);
   },
 };

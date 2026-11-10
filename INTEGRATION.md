@@ -103,17 +103,15 @@ one is refused.
 **Routes poke-guide may call** (exactly its policy in `src/clients.js`; anything
 else is `403 forbidden`):
 
-| Route | Edge cache TTL |
-|---|---|
-| `POST /pricing/v1/prices/quote` (max 100 items) | 1 h, per item |
-| `GET /pricing/v1/prices/product/<digits>` | 1 h |
-| `GET /pricing/v1/history`, `/history/printings`, `/history/coverage` | 1 h |
-| `GET /pricing/v1/games` | 1 h |
-| `GET /catalog/v1/manifest.json` | 60 s |
-| `GET /catalog/v1/artifacts/<file>` | 1 year (content-hashed, immutable) |
-| `GET /catalog/v1/images/<file>` | 24 h |
-| `GET /catalog/v1/products/<digits>` | 1 h |
-| `GET /catalog/v1/games` | 1 h |
+- `POST /pricing/v1/prices/quote` (max 100 items)
+- `GET /pricing/v1/prices/product/<digits>`
+- `GET /pricing/v1/history`, `/history/printings`, `/history/coverage`
+- `GET /pricing/v1/games`
+- `GET /catalog/v1/manifest.json`
+- `GET /catalog/v1/artifacts/<file>`
+- `GET /catalog/v1/images/<file>`
+- `GET /catalog/v1/products/<digits>`
+- `GET /catalog/v1/games`
 
 **Errors a public client should handle** (all JSON `{error, ...}`):
 
@@ -136,18 +134,12 @@ else is `403 forbidden`):
 against the client origins (`https://poke-guide.com`, preview
 `https://dyzfunkshin.github.io`); `Vary: Origin` is always set with it. Allowed
 request headers: `authorization, content-type, x-instance-id`; methods `GET, POST,
-OPTIONS`. Exposed response headers: `X-Quota-Remaining, Retry-After, ETag,
-X-Gateway-Cache`.
+OPTIONS`. Exposed response headers: `X-Quota-Remaining, Retry-After, ETag`.
 
-**Caching.** Public responses are edge-cached and carry
-`X-Gateway-Cache: hit | miss | partial` (`partial` only for quotes, where some
-items came from the edge). `Cache-Control: public, max-age=<TTL>` uses the TTLs in
-the table above; only `200` answers are cached. Quote batches are cached item by
-item (the quote response itself is `no-store`), so a repeat card is answered from
-the edge and only new items reach pricing. Only items that carry a `market` price
-are cached, keyed on the exact `game` / `condition` / `printing` sent; send them
-in canonical form (`"pokemon"`, `"Near Mint"`) or the item always goes to pricing.
-`ETag` is passed through.
+**No gateway caching.** The gateway does not cache. Every allowed call, quotes
+included, reaches the service, and the response is the service's own, passed
+through unchanged (status, body, `content-type`, `ETag`, `Cache-Control`).
+Caching, if any, is set by the service's own `Cache-Control`.
 
 ### Compression
 
@@ -175,8 +167,9 @@ after the owning service's own `INTEGRATION.md` defines it. What these routes re
   header you send is dropped, including `x-fill-policy`.
 - Every pricing request carries the `x-fill-policy` **from your policy**
   (`none` = cache-only, never spends JustTCG budget; `default` = may fill).
-- Responses carry status, body, `content-type`, `ETag`, `Cache-Control`, plus
-  `X-Quota-Remaining` (your daily quota) for credentialed calls.
+- Responses are the service's own, passed through unchanged: status, body,
+  `content-type`, `ETag`, `Cache-Control`, plus `X-Quota-Remaining` (your daily
+  quota) for credentialed calls and CORS headers. The gateway caches nothing.
 - Request bodies are capped at 1 MB; a policy may also cap quote batches.
 
 ## Legacy paths (temporary)
