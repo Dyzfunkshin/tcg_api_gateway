@@ -137,8 +137,13 @@ function createWorld(envOverrides = {}) {
     ...envOverrides,
   };
   const logs = [];
-  const deps = { fetch: fetchImpl, now: () => clock.t, log: (...args) => logs.push(args) };
-  const send = (path, options = {}) => handle(makeRequest(path, options), env, deps);
+  const pending = []; // waitUntil promises: the runtime would keep the isolate alive for them
+  const deps = { fetch: fetchImpl, now: () => clock.t, log: (...args) => logs.push(args), waitUntil: (promise) => pending.push(promise) };
+  const send = async (path, options = {}) => {
+    const res = await handle(makeRequest(path, options), env, deps);
+    await Promise.all(pending.splice(0)); // background cache writes finish before the next call
+    return res;
+  };
   const polarCalls = (action) => calls.filter((c) => c.url === POLAR_HOST + POLAR_PATH + action);
   return { clock, kv, calls, responders, env, deps, logs, send, polarCalls };
 }
@@ -1733,6 +1738,48 @@ test('edge cache: repeated public GETs reach the origin once, until the TTL runs
   const fresh = await w.issue();
   eq((await w.publicSend('/catalog/v1/manifest.json', fresh)).headers.get('x-gateway-cache'), 'miss', 'the manifest is kept only 60 s');
   eq((await w.publicSend(path, fresh)).headers.get('x-gateway-cache'), 'hit', 'the artifact is still cached');
+});
+
+test('edge cache: streams GET bodies through, and still stores the full body via waitUntil', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue();
+  const path = '/catalog/v1/artifacts/pokemon.0123abcd.json';
+  const text = JSON.stringify({ big: 'x'.repeat(5000) });
+  let arrayBufferCalled = false;
+  w.responders.catalog = () => {
+    const chunks = [text.slice(0, 2000), text.slice(2000)];
+    const upstream = new Response(
+      new ReadableStream({
+        start(controller) {
+          for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
+          controller.close();
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json', etag: '"big"' } },
+    );
+    upstream.arrayBuffer = async () => {
+      arrayBufferCalled = true;
+      throw new Error('upstream body was buffered');
+    };
+    return upstream;
+  };
+  const miss = await w.publicSend(path, token);
+  eq(miss.status, 200);
+  eq(miss.headers.get('x-gateway-cache'), 'miss');
+  eq(miss.headers.get('content-type'), 'application/json');
+  ok(!(miss.headers.get('cache-control') || '').includes('no-transform'), 'never no-transform');
+  ok(miss.body instanceof ReadableStream);
+  eq(await miss.text(), text);
+  eq(arrayBufferCalled, false, 'upstream body is never read to an ArrayBuffer');
+  const stored = w.cache.store.get([...w.cache.store.keys()].find((key) => key.includes('pokemon.0123abcd')));
+  eq(new TextDecoder().decode(stored.body), text, 'full body reached the cache');
+  eq(stored.headers['content-type'], 'application/json');
+  const hit = await w.publicSend(path, token);
+  eq(hit.headers.get('x-gateway-cache'), 'hit');
+  eq(await hit.text(), text);
+  eq(hit.headers.get('etag'), '"big"');
+  ok(!(hit.headers.get('cache-control') || '').includes('no-transform'));
+  eq(w.originCalls(CATALOG).length, 1);
 });
 
 test('edge cache: query strings are part of the key; errors are never cached', async () => {
