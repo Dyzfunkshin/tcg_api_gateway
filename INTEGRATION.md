@@ -5,10 +5,14 @@ TCG pricing and catalog services from outside the Droplet. You call the gateway;
 it identifies you, checks your policy, and forwards to the service.
 
 > **Status (built through G5, not yet deployed).** Production
-> `https://api.dyzzyscards.com` is still served by `sourcery-gateway` until
+> `https://api.dyzzyscards.com` (and `api.mintuition.app`) is still served by `sourcery-gateway` (or unattached) until
 > cut-over step G3 (see [docs/PLAN.md](docs/PLAN.md) section 8).
 
 ## Base URL and path scheme
+
+The gateway is served on two hostnames with identical behaviour: `api.dyzzyscards.com`
+(use this for all clients) and `api.mintuition.app` (used by the Mintuition extension).
+Everything below applies to both; examples use `api.dyzzyscards.com`.
 
 ```
 https://api.dyzzyscards.com/pricing/v1/<rest>   ->  pricing  /v1/<rest>
