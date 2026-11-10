@@ -66,6 +66,8 @@ class CloudflareClient:
     def call(self, method: str, path: str, body=None):
         """The `result` of a successful call; raises CloudflareError otherwise."""
         status, parsed = self.raw(method, path, body)
+        if 200 <= status < 300 and not parsed:
+            return None  # e.g. 204 No Content from a custom-domain DELETE: success with no body
         if not (200 <= status < 300 and parsed.get("success") is True):
             raise CloudflareError(method, path, status, parsed.get("errors") or [])
         return parsed.get("result")

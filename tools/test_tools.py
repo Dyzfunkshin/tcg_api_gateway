@@ -92,6 +92,8 @@ class FakeCloudflare:
         if (method, path.split("?")[0], (data or {}).get("service")) in self.fail:
             return 500, json.dumps({"success": False, "errors": [{"code": 10000, "message": "boom"}]}).encode()
         result = self.route(method, path, data)
+        if method == "DELETE" and path.startswith(f"{A}/workers/domains/"):
+            return 204, b""  # what Cloudflare really sends (G3 run, 2026-11-10)
         return 200, json.dumps({"success": True, "errors": [], "result": result}).encode()
 
     def route(self, method, path, data):
@@ -205,6 +207,12 @@ class CloudflareClientTests(unittest.TestCase):
         self.assertEqual(caught.exception.codes, [10000])
         self.assertNotIn(CF_TOKEN, str(caught.exception))
         self.assertNotIn(CF_TOKEN, repr(client))
+
+    def test_empty_2xx_is_success(self):
+        # Regression (G3 run, 2026-11-10): Cloudflare answers a custom-domain DELETE with 204 and no
+        # body; treating that as an error left api.dyzzyscards.com detached with nothing to roll back.
+        client = CloudflareClient(CF_TOKEN, lambda method, url, headers, body: (204, b""))
+        self.assertIsNone(client.delete("/accounts/x/workers/domains/d1"))
 
     def test_non_json_error_body(self):
         client = CloudflareClient(CF_TOKEN, lambda *a: (502, b"<html>bad gateway</html>"))
@@ -381,11 +389,12 @@ class CutoverTests(unittest.TestCase):
         self.assertIn("zone Worker route", h.stderr)
         self.assertEqual(h.cf.mutations(), [])
 
-    def test_domain_attached_nowhere_stops(self):
+    def test_domain_attached_nowhere_is_attached(self):
+        # the state an interrupted run leaves api.dyzzyscards.com in (detached, not yet attached)
         h = Harness(domain_service=None)
-        self.assertEqual(h.cutover(), 1)
-        self.assertIn("not attached to any Worker", h.stderr)
-        self.assertEqual(h.cf.mutations(), [])
+        self.assertEqual(h.cutover(), 0, h.stderr)
+        self.assertEqual(sorted((d["hostname"], d["service"]) for d in h.cf.domains),
+                         [("api.dyzzyscards.com", "tcg-api-gateway"), ("api.mintuition.app", "tcg-api-gateway")])
 
     def test_attach_failure_rolls_back_to_old_worker(self):
         h = Harness(fail={("PUT", f"{A}/workers/domains", "tcg-api-gateway")})
