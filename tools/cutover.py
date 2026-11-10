@@ -125,7 +125,7 @@ def preflight(cloudflare, variables: dict) -> dict:
 
 def attach(cloudflare, service: str, zone_id: str) -> None:
     cloudflare.put(DOMAINS_PATH, {"hostname": CUSTOM_DOMAIN, "service": service,
-                                  "zone_id": zone_id, "environment": "production"})
+                                  "zone_id": zone_id})
 
 
 def move_domain(cloudflare, record: dict) -> None:
