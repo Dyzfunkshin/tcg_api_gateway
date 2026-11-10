@@ -437,11 +437,29 @@ function accessHeaders(env) {
   return { 'cf-access-client-id': id, 'cf-access-client-secret': secret };
 }
 
+// The body as text, or { tooLarge } past MAX_BODY_BYTES. The declared length is only a fast
+// path: a chunked body has none, so the stream is counted as it is read and cancelled the
+// moment it passes the cap, never buffered whole.
 async function readBodyText(request) {
   const declared = Number.parseInt(request.headers.get('content-length') ?? '', 10);
   if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return { tooLarge: true };
-  const buffer = await request.arrayBuffer();
-  if (buffer.byteLength > MAX_BODY_BYTES) return { tooLarge: true };
+  if (!request.body) return { text: '' };
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_BODY_BYTES) {
+      reader.cancel().catch(() => {});
+      return { tooLarge: true };
+    }
+    chunks.push(value);
+  }
+  const buffer = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.byteLength; }
   return { text: new TextDecoder().decode(buffer) };
 }
 

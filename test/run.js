@@ -704,6 +704,40 @@ test('quote: 413 over 1 MB, 400 for non-array or invalid JSON', async () => {
   eq(w.calls.filter((c) => c.url.startsWith(PRICING)).length, 0);
 });
 
+// A chunked body (no content-length) delivered as 64 KB pieces; `total` chunks, or endless.
+function chunkedQuoteRequest(total = Infinity) {
+  const stats = { pulled: 0, cancelled: false };
+  const piece = new TextEncoder().encode(' '.repeat(64 * 1024));
+  const body = new ReadableStream({
+    pull(controller) {
+      if (stats.pulled === 0) controller.enqueue(new TextEncoder().encode('[{"productId":1}'));
+      if (stats.pulled >= total) { controller.enqueue(new TextEncoder().encode(']')); controller.close(); return; }
+      stats.pulled += 1;
+      controller.enqueue(piece);
+    },
+    cancel() { stats.cancelled = true; },
+  });
+  const request = new Request('https://gateway.test/pricing/v1/prices/quote', {
+    method: 'POST', headers: { authorization: 'Bearer ' + KEY, 'x-instance-id': INSTANCE, 'content-type': 'application/json' }, body, duplex: 'half',
+  });
+  return { request, stats };
+}
+
+test('chunked bodies: under the cap are forwarded whole (allow); over it are 413 without being read to the end (deny)', async () => {
+  const w = createWorld();
+  const small = chunkedQuoteRequest(3);
+  eq(small.request.headers.get('content-length'), null, 'no declared length');
+  let res = await handle(small.request, w.env, w.deps);
+  eq(res.status, 200);
+  eq(JSON.parse(lastUpstream(w, PRICING).body), [{ productId: 1 }]);
+  const endless = chunkedQuoteRequest();
+  res = await handle(endless.request, w.env, w.deps);
+  eq([res.status, await readJson(res)], [413, { error: 'payload_too_large' }]);
+  ok(endless.stats.pulled <= 18, 'stopped just past 1 MB, pulled ' + endless.stats.pulled);
+  eq(endless.stats.cancelled, true, 'the rest of the stream was cancelled');
+  ok(w.logs.some(([event, fields]) => event === 'request_rejected' && fields.reason === 'payload_too_large'));
+});
+
 test('products: GET preserves the query string and uses the catalog token', async () => {
   const w = createWorld();
   const res = await w.send('/v1/products/12345?include=prices&lang=en', { headers: { accept: 'application/json' } });
