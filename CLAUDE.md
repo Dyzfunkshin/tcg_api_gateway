@@ -24,6 +24,16 @@ behaviour, and fold any new owner decision back into it.
 
 ```
 npm test        # offline; must stay offline and dependency-free
+python tools/test_tools.py   # offline tests of the operator tools below
+```
+
+Operator tools (Python 3.11+, stdlib + `bitwarden-sdk`; run as owner via `owner-ops`).
+Each prints its plan and contacts nothing unless given `--apply`:
+
+```
+python tools/check_cloudflare_token.py          # read-only token permission check
+python tools/push_secrets.py [--only NAME] [--generate-session-key] [--apply]
+python tools/cutover.py [--preflight | --apply] # G3 cut-over + G4 Access lock; stops for typed go-aheads
 ```
 
 `wrangler` is not a dependency of this repo; use `npx wrangler` when deploying.

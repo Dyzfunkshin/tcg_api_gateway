@@ -273,11 +273,10 @@ The gateway's own secrets go in project **`api-gateway`**
 request time, and should not. `tools/push_secrets.py` reads each secret from
 Bitwarden and writes it to the Worker's secrets through the Cloudflare API
 (`PUT /accounts/{account}/workers/scripts/{script}/secrets`), printing names
-only, never values. Run it after creating or rotating a secret. It follows the
-pattern already used for `sourcery-gateway`:
-`F:/claude_temp/tcg_pricing_service/bw_secret_ops.py push-worker`, run inside
-the pricing image's `/opt/publisher/bin/python`, which has `bitwarden_sdk`.
-That script is a throwaway; promote a cleaned-up version into this repo. Pushes
+only, never values. Run it after creating or rotating a secret. The G3/G4
+Cloudflare steps are `tools/cutover.py`; both share `tools/cloudflare_api.py`,
+print a plan unless given `--apply`, and are tested offline by
+`tools/test_tools.py`. Pushes
 run as the owner, so use the `owner-ops` machine token (read/write on every
 project; Windows Credential Manager entry `owner-ops/bitwarden-machine-token`,
 read with `tcg_catalog_service/tools/machine_token.py --target
@@ -361,7 +360,7 @@ only fixes the names and fields it will key on.
 | G0 | Bootstrap: copy `sourcery/gateway` (src, tests, wrangler) here with a provenance note; deploy as `tcg-api-gateway` on `*.workers.dev` only; same behaviour as today. | gateway | Test suite green; the `workers.dev` URL answers `/v1/health`. |
 | G1 | Namespaced routing `/pricing/v1/*`, `/catalog/v1/*`; client/policy table; legacy aliases mapped. | gateway | Tests cover allow, deny, alias, header stripping, and forced fill policy. |
 | G2 | `GET /pricing/v1/health` open through the gateway; pricing's freshness alert repointed to it. | gateway, pricing | Alert workflow green against the gateway URL. |
-| G3 | Cut `api.dyzzyscards.com` over from `sourcery-gateway` to `tcg-api-gateway`; push secrets. The custom-domain detach (old Worker) and reattach (new Worker) run as **one scripted step**; a gap of seconds to a minute is acceptable (Sourcery is the only live client and retries). The script ends by preparing G4: it creates the Access app and service token and pushes `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET` as Worker secrets. **Build gate:** `POLAR_API_BASE` points at Polar production, not sandbox, before cut-over (sandbox licences can be obtained with test card numbers). **Stop at that step for the owner's go-ahead.** | gateway | Sourcery's deployed e2e passes 8/8 through the new Worker (`F:/claude_temp/poke-scans/sourcery-e2e-deployed.py`). |
+| G3 | Cut `api.dyzzyscards.com` over from `sourcery-gateway` to `tcg-api-gateway`; push secrets. The custom-domain detach (old Worker) and reattach (new Worker) run as **one scripted step**; a gap of seconds to a minute is acceptable (Sourcery is the only live client and retries). The script ends by preparing G4: it creates the Access app and service token and pushes `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET` as Worker secrets. **Build gate:** `POLAR_API_BASE` points at Polar production, not sandbox, before cut-over (sandbox licences can be obtained with test card numbers). **Stop at that step for the owner's go-ahead.** Scripted as `tools/cutover.py`. | gateway | Sourcery's deployed e2e passes 8/8 through the new Worker (`F:/claude_temp/poke-scans/sourcery-e2e-deployed.py`). |
 | G4 | **Immediately after G3**, with no other step or work between them. Lock origins with Access (section 4). Until this lands, `pricing-origin.dyzzyscards.com` and `catalog-origin.dyzzyscards.com` are directly reachable and bypass every gateway check. The lock waits for the owner's go-ahead; the Access prep above has already run. | gateway (+ Cloudflare) | Direct origin curl is denied; e2e still 8/8; freshness alert still green. |
 | G5 | Public sessions: Turnstile, per-IP limits, edge cache, per-item quote cache. | gateway | Tests; a load test shows cached hits never reaching the origin. |
 | G6 | poke-guide switches from R2 snapshots to the gateway (huddle with `_apps/poke_guide`). | poke_guide, gateway | poke-guide.com search and prices work with R2 unused. |
