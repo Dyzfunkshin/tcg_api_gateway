@@ -1,6 +1,6 @@
 """G3 cut-over and G4 Access lock (PLAN.md section 8, rows G3 and G4; section 4).
 
-Usage (from a venv with bitwarden-sdk, as owner via owner-ops):
+Usage (from a venv with bitwarden-sdk, as gateway-deploy):
   python tools/cutover.py              # print the plan; contacts nothing
   python tools/cutover.py --preflight  # read-only checks (GET only)
   python tools/cutover.py --apply      # run every step, stopping twice for a typed go-ahead

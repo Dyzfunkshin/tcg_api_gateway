@@ -1,6 +1,6 @@
 """Push the gateway's Worker secrets from Bitwarden to Cloudflare (PLAN.md section 7).
 
-Usage (from a venv with bitwarden-sdk, as owner via owner-ops):
+Usage (from a venv with bitwarden-sdk, as gateway-deploy):
   python tools/push_secrets.py                         # print the plan; contacts nothing
   python tools/push_secrets.py --apply                 # push every secret in the table
   python tools/push_secrets.py --only PRICING_APP_TOKEN --apply
