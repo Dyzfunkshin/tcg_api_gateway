@@ -19,6 +19,11 @@ id = "3216419ee1244988a05fc0bad9d7b17c"
 [observability]
 enabled = true
 
+# Workers Observability Issues: exceptions, failed invocations and 5xx responses (the gateway's
+# 502 origin_unavailable) are grouped and emailed via the notification policy in PLAN.md 7.3.
+[observability.issues]
+enabled = true
+
 # Non-secret configuration. Secrets are NOT listed here; set each with
 #   npx wrangler secret put <NAME>
 # Secrets: PRICING_APP_TOKEN, CATALOG_APP_TOKEN, and from G4 ACCESS_CLIENT_ID +
