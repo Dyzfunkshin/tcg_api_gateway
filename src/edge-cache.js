@@ -20,25 +20,37 @@ export const cacheUrlForGet = (service, upstreamPath, search) => `${CACHE_HOST}/
 // the answer, so such an item always goes to the origin. Absent selectors stay absent
 // (no defaults): a SKU-only item lets pricing recover selectors from the SKU, which is a
 // different question from one that names them.
+//
+// The key is the exact values pricing receives, never a normalised form: pricing matches
+// game verbatim (String(game), case-sensitive) and echoes the selectors back, so " " or
+// "POKEMON" is a different question from "pokemon" (2026-11-09 security review). A selector
+// that is present but not in canonical form is not cached at all, only forwarded.
 const QUOTE_FIELDS = new Set(['game', 'productId', 'skuId', 'condition', 'printing']);
+const CANONICAL = {
+  game: /^[a-z0-9-]{1,64}$/, // pricing's game ids: "pokemon", "pokemon-japan", "onepiececardgame"
+  // pricing's selector vocabulary is words with single spaces: "Near Mint", "Reverse Holofoil"
+  condition: /^(?=.{1,64}$)[A-Za-z0-9-]+(?: [A-Za-z0-9-]+)*$/,
+  printing: /^(?=.{1,64}$)[A-Za-z0-9-]+(?: [A-Za-z0-9-]+)*$/,
+};
 export function cacheUrlForQuoteItem(item) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
   if (Object.keys(item).some((field) => !QUOTE_FIELDS.has(field))) return null;
   const hasProduct = Number.isSafeInteger(item.productId) && item.productId > 0;
   const hasSku = Number.isSafeInteger(item.skuId) && item.skuId > 0;
   if (hasProduct === hasSku) return null; // exactly one identifier
-  for (const field of ['game', 'condition', 'printing']) {
-    if (item[field] !== undefined && (typeof item[field] !== 'string' || item[field].length > 64)) return null;
+  const params = new URLSearchParams({ id: hasProduct ? 'p' + item.productId : 's' + item.skuId });
+  for (const [field, param] of [['game', 'g'], ['condition', 'c'], ['printing', 'r']]) {
+    if (item[field] === undefined) continue;
+    if (typeof item[field] !== 'string' || !CANONICAL[field].test(item[field])) return null;
+    params.set(param, item[field]);
   }
-  const norm = (value) => (value === undefined ? '' : value.trim().toLowerCase()); // pricing is case-insensitive
-  const params = new URLSearchParams({
-    id: hasProduct ? 'p' + item.productId : 's' + item.skuId,
-    g: norm(item.game),
-    c: norm(item.condition),
-    r: norm(item.printing),
-  });
   return `${CACHE_HOST}/pricing/quote-item?${params}`;
 }
+
+// Only an answer that carries a price is shared: a null price may be a transient miss or
+// the answer to an odd question, and must never be served to everyone for the TTL.
+export const isCacheableQuoteAnswer = (answer) =>
+  Boolean(answer) && typeof answer === 'object' && answer.market !== null && answer.market !== undefined;
 
 // A cached Response, or null on a miss or any cache error.
 export async function cacheGet(cache, url, log) {

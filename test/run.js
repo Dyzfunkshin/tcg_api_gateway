@@ -1812,13 +1812,15 @@ test('quote cache: items are cached one by one; only misses reach pricing; order
   const C = { skuId: 555 };
   let res = await quote([A, B]);
   eq(res.headers.get('x-gateway-cache'), 'miss');
-  res = await quote([B, C, { ...A, condition: 'near mint' }]);
+  res = await quote([B, C, A]);
   eq(res.headers.get('x-gateway-cache'), 'partial');
   eq((await readJson(res)).data.map((q) => [q.productId, q.skuId]), [[2, null], [null, 555], [1, null]]);
-  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), [C], 'only the miss was forwarded (condition matched case-insensitively)');
+  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), [C], 'only the miss was forwarded');
   res = await quote([C, A, B]);
   eq(res.headers.get('x-gateway-cache'), 'hit');
   eq(w.originCalls(PRICING).length, 2, 'an all-hit batch never reaches pricing');
+  res = await quote([{ ...A, condition: 'near mint' }]);
+  eq(res.headers.get('x-gateway-cache'), 'miss', 'selectors are keyed exactly as pricing receives them (no case folding)');
   w.clock.t += 3601 * 1000;
   const fresh = await w.issue();
   res = await w.publicSend('/pricing/v1/prices/quote', fresh, { method: 'POST', body: [A] });
@@ -1841,6 +1843,51 @@ test('quote cache: unusual items always go to pricing; a short or failed answer 
   res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: [{ productId: 7 }] });
   eq(res.status, 400, 'a pricing 4xx passes through');
   eq(w.cache.store.size, 0);
+});
+
+// Pricing's real semantics (cascade.js): game is String(it.game) matched exactly; "" or absent
+// means pokemon. So " " and "POKEMON" are different questions with a null answer.
+function pricingLikeQuote(w) {
+  w.responders.pricing = (call) => {
+    const items = JSON.parse(call.body);
+    return jsonResponse({ data: items.map((it) => {
+      const game = (it.game != null ? String(it.game) : '') || 'pokemon';
+      return { productId: it.productId ?? null, game, market: ['pokemon', 'pokemon-japan'].includes(game) ? 12.34 : null };
+    }) });
+  };
+}
+
+test('quote cache poisoning (regression): a non-canonical game never answers the canonical question', async () => {
+  const w = createPublicWorld();
+  pricingLikeQuote(w);
+  const token = await w.issue();
+  const quote = (items) => w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: items });
+  await quote([{ productId: 42, game: ' ' }]);
+  let res = await quote([{ productId: 42 }]);
+  eq([res.headers.get('x-gateway-cache'), (await readJson(res)).data[0].market], ['miss', 12.34], 'whitespace game did not poison the absent-game key');
+  await quote([{ productId: 43, game: 'POKEMON' }]);
+  res = await quote([{ productId: 43, game: 'pokemon' }]);
+  eq([res.headers.get('x-gateway-cache'), (await readJson(res)).data[0].market], ['miss', 12.34], 'upper-case game did not poison the canonical key');
+});
+
+test('quote cache: canonical items are cached (allow); non-canonical selectors and priceless answers are not (deny)', async () => {
+  const w = createPublicWorld();
+  pricingLikeQuote(w);
+  const token = await w.issue();
+  const quote = (items) => w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: items });
+  const canonical = [{ productId: 1, game: 'pokemon' }, { productId: 2, condition: 'Near Mint', printing: 'Reverse Holofoil' }, { skuId: 3, game: 'pokemon-japan' }];
+  await quote(canonical);
+  eq((await quote(canonical)).headers.get('x-gateway-cache'), 'hit');
+  const before = w.originCalls(PRICING).length;
+  const odd = [{ productId: 1, game: 'Pokemon' }, { productId: 1, game: '' }, { productId: 1, condition: ' Near Mint' }, { productId: 1, printing: 'Holo\u0000' }, { productId: 1, condition: 'Near  Mint' }];
+  await quote(odd);
+  await quote(odd);
+  eq(w.originCalls(PRICING).length, before + 2, 'non-canonical items reach pricing every time');
+  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), odd, 'and are forwarded verbatim');
+  const size = w.cache.store.size;
+  await quote([{ productId: 9, game: 'onepiececardgame' }]); // canonical, but pricing has no price
+  eq(w.cache.store.size, size, 'an answer with market null is never stored');
+  eq((await quote([{ productId: 9, game: 'onepiececardgame' }])).headers.get('x-gateway-cache'), 'miss');
 });
 
 test('CORS: site origins match exactly, extension schemes by prefix', async () => {

@@ -10,7 +10,7 @@ import * as polar from './polar.js';
 import { matchPath } from './routes.js';
 import { DEFAULT_CLIENTS, isOpenRoute, originMatches } from './clients.js';
 import { issueSessionToken, readSessionToken, verifyTurnstile } from './session.js';
-import { cacheUrlForGet, cacheUrlForQuoteItem, cacheGet, cachePut, headersOf } from './edge-cache.js';
+import { cacheUrlForGet, cacheUrlForQuoteItem, isCacheableQuoteAnswer, cacheGet, cachePut, headersOf } from './edge-cache.js';
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const INACTIVE_STATUSES = new Set(['expired', 'revoked', 'disabled']);
@@ -685,7 +685,7 @@ async function cachedQuote(request, target, headers, items, ttlSeconds, deps) {
     missIndexes.map((index, position) => {
       answers[index] = data[position];
       const cacheUrl = cacheUrls[index];
-      return cacheUrl ? cachePut(deps.cache, cacheUrl, JSON.stringify(data[position]), { 'content-type': 'application/json' }, ttlSeconds, deps.log) : null;
+      return cacheUrl && isCacheableQuoteAnswer(data[position]) ? cachePut(deps.cache, cacheUrl, JSON.stringify(data[position]), { 'content-type': 'application/json' }, ttlSeconds, deps.log) : null;
     }),
   );
   return respond(missIndexes.length === items.length ? 'miss' : 'partial');
