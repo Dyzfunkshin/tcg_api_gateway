@@ -44,7 +44,7 @@ SESSION_TTL_SECONDS = "1800"    # lifetime of a public session token (PLAN.md 6.
 # names it in src/clients.js. namespace_id is any account-unique integer string.
 # Syntax not yet checked against a real `wrangler deploy` (no deploys until G0 is cleared).
 [[ratelimits]]
-name = "RATE_LIMIT_LICENSE"   # Sourcery licence keys, keyed by key hash
+name = "RATE_LIMIT_LICENSE"   # Mintuition licence keys, keyed by key hash
 namespace_id = "1001"
 simple = { limit = 300, period = 60 }
 

@@ -39,7 +39,7 @@ Request and response bodies are the services' own: **each service's
 | `GET /catalog/v1/games` | catalog game lines |
 | `GET /catalog/v1/tags`, `POST /catalog/v1/tags/<eqKey>` | tags (the POST is a write, granted to no client by default) |
 | `GET /v1/health` | gateway config check, no upstream call: `{ok, origins:{pricing, catalog}}` |
-| `POST /v1/license/activate`, `POST /v1/license/deactivate`, `GET /v1/license` | Sourcery licence lifecycle (Polar) |
+| `POST /v1/license/activate`, `POST /v1/license/deactivate`, `GET /v1/license` | Mintuition licence lifecycle (Polar) |
 | `POST /v1/session` | public browser session from a Turnstile proof (see below) |
 
 Knowing a route is not permission to call it: **your client's policy lists the
@@ -53,7 +53,7 @@ Send exactly one credential:
 | Client kind | Header(s) |
 |---|---|
 | Server-side app | `Authorization: Bearer <app key>` (64 hex chars, issued per app) |
-| Sourcery extension | `Authorization: Bearer <licence key>` + `X-Instance-Id: <activation id>` |
+| Mintuition extension | `Authorization: Bearer <licence key>` + `X-Instance-Id: <activation id>` |
 | Public website (poke-guide) | `Authorization: Session <token>` from `POST /v1/session`, sent from the same `Origin` |
 | Open routes only (`GET /v1/health`, `POST /v1/license/activate`, `POST /v1/session`, `GET /pricing/v1/health`) | no `Authorization` header (per-IP rate limited) |
 
@@ -174,7 +174,7 @@ after the owning service's own `INTEGRATION.md` defines it. What these routes re
 
 ## Legacy paths (temporary)
 
-Old Sourcery paths keep working and are logged as `legacy_alias`; they are
+Old Mintuition-extension paths keep working and are logged as `legacy_alias`; they are
 removed at G7: `POST /v1/prices/quote`, `POST /v1/products:lookup`,
 `GET /v1/products/<id>`, `GET /v1/prices/games`, `GET /v1/catalog/games`.
 
