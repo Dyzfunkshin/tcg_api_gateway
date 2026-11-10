@@ -2,43 +2,26 @@
 
 Usage (from a venv with bitwarden-sdk):  python tools/check_cloudflare_token.py
 
-Reads TCG_GATEWAY_CLOUDFLARE_API_TOKEN from Bitwarden (owner-ops) and makes only
+Reads sourcery_cloudflare_api_token from Bitwarden (owner-ops) and makes only
 GET requests, one per permission the plan needs (PLAN.md section 7). Prints each
 check's name and HTTP status, never the token. Exit code 0 only if all pass.
 """
 
-import json
 import sys
-import urllib.error
-import urllib.request
 
 from bitwarden_secrets import bitwarden_client, secret_value
+from cloudflare_api import ACCOUNT_ID, CLOUDFLARE_TOKEN_KEY, ZONE_NAME, CloudflareClient
 
-ACCOUNT_ID = "722b682d1c0bb958ea4d14b5bc6275d1"
-ZONE_NAME = "dyzzyscards.com"
 LICENSES_KV_ID = "3216419ee1244988a05fc0bad9d7b17c"
-API = "https://api.cloudflare.com/client/v4"
-
-
-def get(path: str, token: str) -> tuple[int, dict]:
-    request = urllib.request.Request(API + path, headers={"Authorization": "Bearer " + token, "User-Agent": "tcg-api-gateway-ops"})
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.status, json.load(response)
-    except urllib.error.HTTPError as error:
-        try:
-            return error.code, json.load(error)
-        except ValueError:
-            return error.code, {}
 
 
 def main() -> int:
-    token = secret_value(bitwarden_client(), "TCG_GATEWAY_CLOUDFLARE_API_TOKEN")
+    cloudflare = CloudflareClient(secret_value(bitwarden_client(), CLOUDFLARE_TOKEN_KEY))
     failures = 0
 
     def check(name: str, path: str, extra=None):
         nonlocal failures
-        status, body = get(path, token)
+        status, body = cloudflare.raw("GET", path)
         detail = ""
         passed = status == 200 and body.get("success") is True
         if passed and extra:
