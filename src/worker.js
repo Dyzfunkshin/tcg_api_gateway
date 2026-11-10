@@ -95,7 +95,7 @@ function toPairMap(value) {
 
 // ---------- tiers ----------
 
-const DEFAULT_FILL_POLICY_BY_TIER = 'basic:none,pro:default';
+const DEFAULT_FILL_POLICY_BY_TIER = 'collector:default,trader:default,pro:default';
 
 // The tier a benefit id maps to through POLAR_TIERS, else null.
 const tierForBenefit = (benefitId, env) => toPairMap(env.POLAR_TIERS).get(String(benefitId)) ?? null;

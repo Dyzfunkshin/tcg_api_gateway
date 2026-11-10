@@ -209,9 +209,9 @@ Unchanged from `sourcery/gateway`: Polar `validate` / `activate` /
 `deactivate`, verdicts cached in the `LICENSES` KV namespace for
 `LICENSE_CACHE_SECONDS` with `LICENSE_GRACE_SECONDS` of grace when Polar is
 down, `POLAR_TIERS` mapping benefit ids to tiers. Polar's licence endpoints
-are public, so no Polar secret is needed. Note that `wrangler.toml` there
-still points `POLAR_API_BASE` at the **sandbox**; switching to production is
-a Sourcery launch decision, not this migration's.
+are public, so no Polar secret is needed. This gateway points
+`POLAR_API_BASE` at Polar **production** (decision 27); a test fails if it is
+ever set back to the sandbox.
 
 ### 6.3 Public browser clients (poke-guide and our own web apps)
 
@@ -539,3 +539,12 @@ sections above):
     origin load ever matters, the services set their own `Cache-Control` and
     Cloudflare caches on that; the gateway stays blind to it. Licence
     verdict caching is the gateway's own auth state and is unchanged.
+27. **Polar production, three paid tiers** (owner, 2026-11-10). `POLAR_API_BASE`
+    is `https://api.polar.sh`; organization `876bc883-f2c8-48a7-be15-ac1470d159ae`.
+    Tiers by License Keys benefit id: collector `06d0e2f9-…`, trader
+    `bae5bb05-…`, pro `c563b5ed-…` (full ids in `wrangler.toml`). All three are
+    paid, so all three get `x-fill-policy: default` (may spend JustTCG budget);
+    a benefit outside `POLAR_TIERS` is refused. Satisfies the G3 build gate.
+    Sandbox licences cached in `LICENSES` KV carry the sandbox organization id
+    and are refused by the organization check. Sourcery's checkout links must
+    point at these production products (Sourcery repo, not this one).
