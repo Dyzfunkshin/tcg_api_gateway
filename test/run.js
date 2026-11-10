@@ -1072,11 +1072,33 @@ test('tier: cached with the verdict, no second validate needed to report it', as
   eq(w.polarCalls('validate').length, 1);
 });
 
+test('quote: with no FILL_POLICY_BY_TIER, every paid tier (collector, trader, pro) may fill; an unknown tier falls back to FILL_POLICY', async () => {
+  const tiers = 'b-col:collector,b-tra:trader,b-pro:pro,b-odd:legacy';
+  for (const benefit of ['b-col', 'b-tra', 'b-pro']) {
+    const w = createWorld({ POLAR_TIERS: tiers, FILL_POLICY: 'none' });
+    w.responders.validate = withBenefit(benefit);
+    eq(await quoteFillPolicy(w), 'default', `${benefit} may fill`);
+  }
+  const w = createWorld({ POLAR_TIERS: tiers, FILL_POLICY: 'none' });
+  w.responders.validate = withBenefit('b-odd');
+  eq(await quoteFillPolicy(w), 'none', 'a tier missing from the table never fills');
+});
+
+test('wrangler.toml: Polar is production and every deployed tier is mapped', async () => {
+  const toml = (await import('node:fs')).readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8');
+  const variable = (name) => toml.match(new RegExp(`^${name}\\s*=\\s*"([^"]*)"`, 'm'))?.[1];
+  eq(variable('POLAR_API_BASE'), 'https://api.polar.sh', 'never deploy against the Polar sandbox');
+  const tiers = variable('POLAR_TIERS').split(',').map((pair) => pair.split(':')[1]);
+  const byTier = new Map(variable('FILL_POLICY_BY_TIER').split(',').map((pair) => pair.split(':')));
+  for (const tier of tiers) eq(byTier.has(tier), true, `tier ${tier} has a fill policy`);
+});
+
 test('quote: x-fill-policy is default for pro, none for basic and for an unmapped benefit', async () => {
-  let w = createWorld({ POLAR_TIERS: TIERS, FILL_POLICY: 'cheapest' });
+  const byTier = 'basic:none,pro:default';
+  let w = createWorld({ POLAR_TIERS: TIERS, FILL_POLICY: 'cheapest', FILL_POLICY_BY_TIER: byTier });
   w.responders.validate = withBenefit('benefit-pro');
   eq(await quoteFillPolicy(w), 'default');
-  w = createWorld({ POLAR_TIERS: TIERS, FILL_POLICY: 'cheapest' });
+  w = createWorld({ POLAR_TIERS: TIERS, FILL_POLICY: 'cheapest', FILL_POLICY_BY_TIER: byTier });
   w.responders.validate = withBenefit('benefit-basic');
   eq(await quoteFillPolicy(w), 'none');
   w = createWorld({ POLAR_TIERS: TIERS, POLAR_BENEFIT_IDS: 'benefit-other' });

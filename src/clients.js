@@ -50,7 +50,7 @@ export const LICENSE_CLIENT = Object.freeze({
     'catalog:products.get',
     'catalog:games',
   ]),
-  fillPolicy: 'by-license-tier', // basic:none, pro:default via FILL_POLICY_BY_TIER
+  fillPolicy: 'by-license-tier', // collector/trader/pro all default via FILL_POLICY_BY_TIER
   quota: Object.freeze({ daily: 20000, perMinute: 300, perMinuteBinding: 'RATE_LIMIT_LICENSE' }),
   maxQuoteItems: null,
   origins: Object.freeze(['chrome-extension://', 'moz-extension://']),
