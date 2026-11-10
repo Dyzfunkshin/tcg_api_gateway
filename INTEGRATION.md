@@ -124,9 +124,9 @@ else is `403 forbidden`):
 | 403 | `forbidden` | route not in the poke-guide policy |
 | 403 | `origin_not_allowed` | `Origin` is not one of the client's origins |
 | 403 | `turnstile_failed` | challenge not solved, solved on another site, or the widget lacks the `gateway-session` action |
-| 413 | `payload_too_large` | body over 1 MB |
+| 413 | `payload_too_large` | body over 1 MB (also for a chunked body with no `Content-Length`) |
 | 413 | `batch_too_large` (`{"error":"batch_too_large","max":100}`) | quote batch over 100 items: split it |
-| 429 | `quota_exceeded` (`scope: "minute"`) | back off for the `Retry-After` seconds |
+| 429 | `quota_exceeded` (`scope: "minute"`) | back off for the `Retry-After` seconds; limited per IP (an IPv6 /64) and per session token |
 | 502 | `origin_unavailable` | the service failed or is unreachable |
 | 503 | `turnstile_unavailable` | Turnstile down: retry after `Retry-After` |
 | 503 | `session_not_configured` / `origin_not_configured` | gateway misconfigured |
@@ -144,7 +144,10 @@ X-Gateway-Cache`.
 items came from the edge). `Cache-Control: public, max-age=<TTL>` uses the TTLs in
 the table above; only `200` answers are cached. Quote batches are cached item by
 item (the quote response itself is `no-store`), so a repeat card is answered from
-the edge and only new items reach pricing. `ETag` is passed through.
+the edge and only new items reach pricing. Only items that carry a `market` price
+are cached, keyed on the exact `game` / `condition` / `printing` sent; send them
+in canonical form (`"pokemon"`, `"Near Mint"`) or the item always goes to pricing.
+`ETag` is passed through.
 
 ### Compression
 
@@ -198,11 +201,11 @@ All errors are JSON `{error, ...}`.
 | 404 | `not_found` | unknown path |
 | 405 | `method_not_allowed` | known path, wrong method (`Allow` header lists methods) |
 | 409 | `activation_limit` | licence activation limit reached |
-| 413 | `payload_too_large` / `batch_too_large` | body over 1 MB / quote batch over your policy's `max` |
+| 413 | `payload_too_large` / `batch_too_large` | body over 1 MB (declared or chunked) / quote batch over your policy's `max` |
 | 429 | `quota_exceeded` | `scope` `minute` or `day`; honour `Retry-After` |
 | 429 | `license_attempts_exceeded` | too many licence checks (validate, activate, deactivate) from one IP in a minute; sent with `Retry-After: 60` |
 | 502 | `origin_unavailable` | the service failed or is unreachable |
-| 503 | `origin_not_configured` / `license_service_unavailable` | gateway misconfigured / Polar down (with `Retry-After`) |
+| 503 | `origin_not_configured` / `license_service_unavailable` | gateway misconfigured / Polar down or the gateway's Polar budget spent (with `Retry-After`; a recently checked licence keeps working) |
 
 ## Smoke test
 
