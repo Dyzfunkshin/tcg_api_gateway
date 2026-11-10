@@ -1238,6 +1238,11 @@ function fakeRateLimiter(limit) {
 
 const lastUpstream = (w, origin) => w.calls.filter((c) => c.url.startsWith(origin)).at(-1);
 
+test('routes: tag-key segments allow encoded catalog keys (allow) but no encoded slash, backslash, dot or control, and no leading dot (deny)', async () => {
+  for (const key of ['mew%7C25', 'Farfetch%27d%7C1', 'pikachu%7C25a', 'a.b_c-d%7C1', '100%25%7C1']) eq(matchPath('/catalog/v1/tags/' + key)?.routes[0].id, 'catalog:tags.write', key);
+  for (const key of ['a%2f..%2f..%2fadmin', 'a%2Fb', '%2e%2e', '..', '.hidden', 'a%5cb', 'a%00b', 'a%7fb', 'a b', 'a%2', 'x'.repeat(201)]) eq(matchPath('/catalog/v1/tags/' + key), null, key);
+});
+
 test('routes: namespaced paths resolve to service routes; unknown and traversal paths do not', async () => {
   eq(matchPath('/pricing/v1/prices/quote').routes[0].id, 'pricing:quote');
   eq(matchPath('/pricing/v1/prices/quote').upstreamPath, '/v1/prices/quote');
