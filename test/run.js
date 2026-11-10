@@ -137,13 +137,8 @@ function createWorld(envOverrides = {}) {
     ...envOverrides,
   };
   const logs = [];
-  const pending = []; // waitUntil promises: the runtime would keep the isolate alive for them
-  const deps = { fetch: fetchImpl, now: () => clock.t, log: (...args) => logs.push(args), waitUntil: (promise) => pending.push(promise) };
-  const send = async (path, options = {}) => {
-    const res = await handle(makeRequest(path, options), env, deps);
-    await Promise.all(pending.splice(0)); // background cache writes finish before the next call
-    return res;
-  };
+  const deps = { fetch: fetchImpl, now: () => clock.t, log: (...args) => logs.push(args) };
+  const send = (path, options = {}) => handle(makeRequest(path, options), env, deps);
   const polarCalls = (action) => calls.filter((c) => c.url === POLAR_HOST + POLAR_PATH + action);
   return { clock, kv, calls, responders, env, deps, logs, send, polarCalls };
 }
@@ -819,7 +814,7 @@ test('products:lookup forwards the POST body', async () => {
 });
 
 // The services each serve their games list (owner 2026-11-08; huddles pricing-games-list, catalog-games-list).
-test('games lists: /v1/prices/games and /v1/catalog/games reach each origin\'s /v1/games with its token, cached an hour', async () => {
+test('games lists: /v1/prices/games and /v1/catalog/games reach each origin\'s /v1/games with its token, headers passed through', async () => {
   const w = createWorld();
   const pricingGames = { games: [{ id: 'pokemon', name: 'Pokémon', categories: [3, 85] }] };
   const catalogGames = { catalogVersion: 'v1', games: [{ id: 'pokemon', name: 'Pokemon', categories: [3], products: 33076 }] };
@@ -828,7 +823,7 @@ test('games lists: /v1/prices/games and /v1/catalog/games reach each origin\'s /
   let res = await w.send('/v1/prices/games');
   eq(res.status, 200);
   eq(await readJson(res), pricingGames);
-  eq(res.headers.get('cache-control'), 'private, max-age=3600', 'an origin that sends no cache header gets the hour');
+  eq(res.headers.get('cache-control'), null, 'an origin that sends no cache header gets none from the gateway');
   let call = w.calls.find((c) => c.url.startsWith(PRICING));
   // every pricing request carries the policy's fill policy (pricing treats an absent header as "default")
   eq([call.url, call.method, call.headers['x-app-token'], call.headers['x-fill-policy']], [PRICING + '/v1/games', 'GET', 'pricing-secret', 'none']);
@@ -887,7 +882,7 @@ test('CORS: allowed extension origin gets headers on normal and error responses'
   eq(res.headers.get('vary'), 'Origin');
   eq(res.headers.get('access-control-allow-headers'), 'authorization, content-type, x-instance-id');
   eq(res.headers.get('access-control-allow-methods'), 'GET, POST, OPTIONS');
-  eq(res.headers.get('access-control-expose-headers'), 'X-Quota-Remaining, Retry-After, ETag, X-Gateway-Cache');
+  eq(res.headers.get('access-control-expose-headers'), 'X-Quota-Remaining, Retry-After, ETag');
   res = await w.send('/v1/license', { key: null, origin: 'moz-extension://xyz' });
   eq(res.status, 401);
   eq(res.headers.get('access-control-allow-origin'), 'moz-extension://xyz');
@@ -1215,7 +1210,6 @@ async function createAppWorld({ fillPolicy = 'default', routes, quota, maxQuoteI
     quota: quota ?? { daily: 1000, perMinute: 100, perMinuteBinding: 'RATE_LIMIT_APP' },
     maxQuoteItems,
     origins: [],
-    cache: null,
   });
   w.deps.clients = { ...DEFAULT_CLIENTS, appKeys: [app] };
   assertValidClients(w.deps.clients);
@@ -1564,13 +1558,13 @@ test('access: only one of the two secrets set is a 503, logged, with no upstream
   }
 });
 
-// ---------- G5: public sessions, edge cache, per-item quote cache ----------
+// ---------- G5: public sessions ----------
 
 const SITE = 'https://poke-guide.com';
 const PREVIEW = 'https://dyzfunkshin.github.io';
 const SESSION_ENV = { TURNSTILE_SECRET_KEY: 'turnstile-secret', SESSION_SIGNING_KEY: 'signing-key-0123456789abcdef', RATE_LIMIT_PUBLIC: undefined };
 
-// A Cache API stand-in that honours max-age against the world clock.
+// A Cache API stand-in that honours max-age against the world clock (licence verdicts).
 function createFakeCache(clock) {
   const store = new Map();
   return {
@@ -1592,12 +1586,10 @@ function createFakeCache(clock) {
   };
 }
 
-// A world with the poke-guide client, a fake edge cache, Turnstile, and a pricing origin
-// that answers a quote item by item (so merges can be checked).
+// A world with the poke-guide client, Turnstile, and a pricing origin that answers a quote
+// item by item.
 function createPublicWorld(envOverrides = {}) {
   const w = createWorld({ ...SESSION_ENV, ...envOverrides });
-  w.cache = createFakeCache(w.clock);
-  w.deps.cache = w.cache;
   w.turnstile = { success: true, hostname: 'poke-guide.com', action: 'gateway-session' };
   w.siteverifyCalls = [];
   const innerFetch = w.deps.fetch;
@@ -1887,29 +1879,34 @@ test('per-IP limits key IPv6 on the /64: rotating within it is refused (deny), a
   eq(attempts.keys, ['ip:2001:db8:9:9::/64', 'ip:2001:db8:9:9::/64']);
 });
 
-test('edge cache: repeated public GETs reach the origin once, until the TTL runs out', async () => {
+// Owner 2026-11-09 (PLAN.md decision 26): the gateway never caches service responses.
+// Any x-gateway-* response header would be the gateway annotating a service payload.
+const gatewayHeaderNames = (res) => [...res.headers.keys()].filter((name) => name.startsWith('x-gateway'));
+test('pass-through: every public GET reaches the origin, status, body and origin headers byte-for-byte (allow)', async () => {
   const w = createPublicWorld();
   const token = await w.issue();
   const path = '/catalog/v1/artifacts/pokemon.0123abcd.json';
-  for (let i = 0; i < 50; i += 1) {
-    const res = await w.publicSend(path, token, { ip: `10.0.0.${i}` });
+  const text = '{"big":"' + 'x'.repeat(5000) + '"}';
+  w.responders.catalog = () => new Response(text, { status: 200, headers: { 'content-type': 'application/json; charset=utf-8', etag: '"cat-1"', 'cache-control': 'public, max-age=31536000, immutable' } });
+  for (let i = 0; i < 2; i += 1) {
+    const res = await w.publicSend(path, token);
     eq(res.status, 200);
-    eq(res.headers.get('x-gateway-cache'), i === 0 ? 'miss' : 'hit');
-    eq(res.headers.get('etag'), '"cat"');
-    eq(res.headers.get('cache-control'), 'public, max-age=31536000');
+    eq(await res.text(), text);
+    eq([res.headers.get('content-type'), res.headers.get('etag'), res.headers.get('cache-control')], ['application/json; charset=utf-8', '"cat-1"', 'public, max-age=31536000, immutable']);
+    eq(gatewayHeaderNames(res), [], 'no gateway cache marker');
   }
-  eq(w.originCalls(CATALOG).length, 1, '50 requests, one origin call');
-  await w.publicSend('/catalog/v1/manifest.json', token);
-  w.clock.t += 61 * 1000;
-  const fresh = await w.issue();
-  eq((await w.publicSend('/catalog/v1/manifest.json', fresh)).headers.get('x-gateway-cache'), 'miss', 'the manifest is kept only 60 s');
-  eq((await w.publicSend(path, fresh)).headers.get('x-gateway-cache'), 'hit', 'the artifact is still cached');
+  eq(w.originCalls(CATALOG).length, 2, 'two identical calls, two origin fetches');
+  w.responders.catalog = () => new Response('nope', { status: 404, headers: { 'content-type': 'text/plain' } });
+  const missing = await w.publicSend('/catalog/v1/products/9', token);
+  eq([missing.status, await missing.text()], [404, 'nope'], 'a 4xx passes through unchanged');
+  w.responders.catalog = () => new Response('{"product":9}', { status: 200, headers: { 'content-type': 'application/json' } });
+  const res = await w.publicSend('/catalog/v1/products/9', token);
+  eq([res.status, res.headers.get('cache-control')], [200, null], 'no cache-control is invented when the origin sends none');
 });
 
-test('edge cache: streams GET bodies through, and still stores the full body via waitUntil', async () => {
+test('pass-through: GET bodies are streamed, never buffered', async () => {
   const w = createPublicWorld();
   const token = await w.issue();
-  const path = '/catalog/v1/artifacts/pokemon.0123abcd.json';
   const text = JSON.stringify({ big: 'x'.repeat(5000) });
   let arrayBufferCalled = false;
   w.responders.catalog = () => {
@@ -1929,131 +1926,47 @@ test('edge cache: streams GET bodies through, and still stores the full body via
     };
     return upstream;
   };
-  const miss = await w.publicSend(path, token);
-  eq(miss.status, 200);
-  eq(miss.headers.get('x-gateway-cache'), 'miss');
-  eq(miss.headers.get('content-type'), 'application/json');
-  ok(!(miss.headers.get('cache-control') || '').includes('no-transform'), 'never no-transform');
-  ok(miss.body instanceof ReadableStream);
-  eq(await miss.text(), text);
+  const res = await w.publicSend('/catalog/v1/artifacts/pokemon.0123abcd.json', token);
+  eq(res.status, 200);
+  ok(res.body instanceof ReadableStream);
+  eq(await res.text(), text);
   eq(arrayBufferCalled, false, 'upstream body is never read to an ArrayBuffer');
-  const stored = w.cache.store.get([...w.cache.store.keys()].find((key) => key.includes('pokemon.0123abcd')));
-  eq(new TextDecoder().decode(stored.body), text, 'full body reached the cache');
-  eq(stored.headers['content-type'], 'application/json');
-  const hit = await w.publicSend(path, token);
-  eq(hit.headers.get('x-gateway-cache'), 'hit');
-  eq(await hit.text(), text);
-  eq(hit.headers.get('etag'), '"big"');
-  ok(!(hit.headers.get('cache-control') || '').includes('no-transform'));
-  eq(w.originCalls(CATALOG).length, 1);
+  eq([res.headers.get('etag'), gatewayHeaderNames(res)], ['"big"', []]);
 });
 
-test('edge cache: query strings are part of the key; errors are never cached', async () => {
+test('pass-through: every public quote is forwarded as sent, the answer returned byte-for-byte (allow)', async () => {
   const w = createPublicWorld();
   const token = await w.issue();
-  await w.publicSend('/pricing/v1/history?game=pokemon&productId=1', token);
-  eq((await w.publicSend('/pricing/v1/history?game=pokemon&productId=2', token)).headers.get('x-gateway-cache'), 'miss');
-  w.responders.catalog = () => jsonResponse({ error: 'not_found' }, 404);
-  eq((await w.publicSend('/catalog/v1/products/9', token)).status, 404);
-  w.responders.catalog = () => jsonResponse({ product: 9 });
-  const res = await w.publicSend('/catalog/v1/products/9', token);
-  eq([res.status, res.headers.get('x-gateway-cache')], [200, 'miss'], 'the 404 was not stored');
-});
-
-test('edge cache: licence and anonymous traffic never reads or writes it', async () => {
-  const w = createPublicWorld();
-  await w.send('/catalog/v1/products/1');
-  await w.send('/catalog/v1/products/1');
-  await w.send('/pricing/v1/health', { key: null, instance: null });
-  eq(w.cache.store.size, 0);
-  eq(w.originCalls(CATALOG).length, 2);
-});
-
-test('quote cache: items are cached one by one; only misses reach pricing; order is kept', async () => {
-  const w = createPublicWorld();
-  const token = await w.issue();
-  const quote = (items) => w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: items });
-  const A = { productId: 1, condition: 'Near Mint', printing: 'Holofoil' };
-  const B = { productId: 2 };
-  const C = { skuId: 555 };
-  let res = await quote([A, B]);
-  eq(res.headers.get('x-gateway-cache'), 'miss');
-  res = await quote([B, C, A]);
-  eq(res.headers.get('x-gateway-cache'), 'partial');
-  eq((await readJson(res)).data.map((q) => [q.productId, q.skuId]), [[2, null], [null, 555], [1, null]]);
-  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), [C], 'only the miss was forwarded');
-  res = await quote([C, A, B]);
-  eq(res.headers.get('x-gateway-cache'), 'hit');
-  eq(w.originCalls(PRICING).length, 2, 'an all-hit batch never reaches pricing');
-  res = await quote([{ ...A, condition: 'near mint' }]);
-  eq(res.headers.get('x-gateway-cache'), 'miss', 'selectors are keyed exactly as pricing receives them (no case folding)');
-  w.clock.t += 3601 * 1000;
-  const fresh = await w.issue();
-  res = await w.publicSend('/pricing/v1/prices/quote', fresh, { method: 'POST', body: [A] });
-  eq(res.headers.get('x-gateway-cache'), 'miss', 'items expire after an hour');
-});
-
-test('quote cache: unusual items always go to pricing; a short or failed answer is not merged', async () => {
-  const w = createPublicWorld();
-  const token = await w.issue();
-  const odd = [{ productId: 1, extra: true }, { productId: 1, skuId: 2 }, { condition: 'Near Mint' }, { productId: '1' }];
-  await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: odd });
-  await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: odd });
-  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), odd, 'uncacheable items are forwarded every time');
-  eq(w.cache.store.size, 0);
+  const items = [{ productId: 1, condition: 'Near Mint', printing: 'Holofoil' }, { skuId: 555 }, { productId: 1, extra: true, game: ' POKEMON ' }];
+  const answer = '{"data":[{"market":1.5},{"market":null},{"market":2}],"note":"origin-shaped"}';
+  w.responders.pricing = () => new Response(answer, { status: 200, headers: { 'content-type': 'application/json', etag: '"q1"', 'cache-control': 'private, max-age=30' } });
+  const raw = JSON.stringify(items);
+  for (let i = 0; i < 2; i += 1) {
+    const res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: raw });
+    eq(res.status, 200);
+    eq(await res.text(), answer);
+    eq([res.headers.get('etag'), res.headers.get('cache-control'), gatewayHeaderNames(res)], ['"q1"', 'private, max-age=30', []]);
+    eq(w.originCalls(PRICING).at(-1).body, raw, 'the body reaches pricing exactly as sent');
+  }
+  eq(w.originCalls(PRICING).length, 2, 'two identical quotes, two origin fetches');
   w.responders.pricing = () => jsonResponse({ data: [] });
-  let res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: [{ productId: 7 }] });
-  eq(res.status, 502);
-  ok(w.logs.some(([event]) => event === 'quote_shape_mismatch'));
+  const short = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: [{ productId: 7 }] });
+  eq([short.status, await readJson(short)], [200, { data: [] }], 'the gateway does not judge the answer shape');
   w.responders.pricing = () => jsonResponse({ error: 'bad' }, 400);
-  res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: [{ productId: 7 }] });
-  eq(res.status, 400, 'a pricing 4xx passes through');
-  eq(w.cache.store.size, 0);
+  eq((await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: [{ productId: 7 }] })).status, 400, 'a pricing 4xx passes through');
 });
 
-// Pricing's real semantics (cascade.js): game is String(it.game) matched exactly; "" or absent
-// means pokemon. So " " and "POKEMON" are different questions with a null answer.
-function pricingLikeQuote(w) {
-  w.responders.pricing = (call) => {
-    const items = JSON.parse(call.body);
-    return jsonResponse({ data: items.map((it) => {
-      const game = (it.game != null ? String(it.game) : '') || 'pokemon';
-      return { productId: it.productId ?? null, game, market: ['pokemon', 'pokemon-japan'].includes(game) ? 12.34 : null };
-    }) });
-  };
-}
-
-test('quote cache poisoning (regression): a non-canonical game never answers the canonical question', async () => {
+test('pass-through: public quotes still meet the batch cap, route allow-list and forced fill policy (deny)', async () => {
   const w = createPublicWorld();
-  pricingLikeQuote(w);
   const token = await w.issue();
-  const quote = (items) => w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: items });
-  await quote([{ productId: 42, game: ' ' }]);
-  let res = await quote([{ productId: 42 }]);
-  eq([res.headers.get('x-gateway-cache'), (await readJson(res)).data[0].market], ['miss', 12.34], 'whitespace game did not poison the absent-game key');
-  await quote([{ productId: 43, game: 'POKEMON' }]);
-  res = await quote([{ productId: 43, game: 'pokemon' }]);
-  eq([res.headers.get('x-gateway-cache'), (await readJson(res)).data[0].market], ['miss', 12.34], 'upper-case game did not poison the canonical key');
-});
-
-test('quote cache: canonical items are cached (allow); non-canonical selectors and priceless answers are not (deny)', async () => {
-  const w = createPublicWorld();
-  pricingLikeQuote(w);
-  const token = await w.issue();
-  const quote = (items) => w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: items });
-  const canonical = [{ productId: 1, game: 'pokemon' }, { productId: 2, condition: 'Near Mint', printing: 'Reverse Holofoil' }, { skuId: 3, game: 'pokemon-japan' }];
-  await quote(canonical);
-  eq((await quote(canonical)).headers.get('x-gateway-cache'), 'hit');
-  const before = w.originCalls(PRICING).length;
-  const odd = [{ productId: 1, game: 'Pokemon' }, { productId: 1, game: '' }, { productId: 1, condition: ' Near Mint' }, { productId: 1, printing: 'Holo\u0000' }, { productId: 1, condition: 'Near  Mint' }];
-  await quote(odd);
-  await quote(odd);
-  eq(w.originCalls(PRICING).length, before + 2, 'non-canonical items reach pricing every time');
-  eq(JSON.parse(w.originCalls(PRICING).at(-1).body), odd, 'and are forwarded verbatim');
-  const size = w.cache.store.size;
-  await quote([{ productId: 9, game: 'onepiececardgame' }]); // canonical, but pricing has no price
-  eq(w.cache.store.size, size, 'an answer with market null is never stored');
-  eq((await quote([{ productId: 9, game: 'onepiececardgame' }])).headers.get('x-gateway-cache'), 'miss');
+  let res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: Array.from({ length: 101 }, (_, i) => ({ productId: i + 1 })) });
+  eq([res.status, await readJson(res)], [413, { error: 'batch_too_large', max: 100 }]);
+  res = await w.publicSend('/catalog/v1/products:lookup', token, { method: 'POST', body: [{ productId: 1 }] });
+  eq(res.status, 403, 'a route outside the public allow-list is refused');
+  eq(w.originCalls(PRICING).length + w.originCalls(CATALOG).length, 0, 'refused calls never reach an origin');
+  res = await w.publicSend('/pricing/v1/prices/quote', token, { method: 'POST', body: [{ productId: 1 }], headers: { 'x-fill-policy': 'default' } });
+  eq(res.status, 200);
+  eq(w.originCalls(PRICING).at(-1).headers['x-fill-policy'], 'none', 'the client cannot lift the forced fill policy');
 });
 
 test('CORS: site origins match exactly, extension schemes by prefix', async () => {
@@ -2065,7 +1978,7 @@ test('CORS: site origins match exactly, extension schemes by prefix', async () =
   eq(corsHeaders('chrome-extension://anything', origins)['Access-Control-Allow-Origin'], 'chrome-extension://anything');
 });
 
-test('policy table: public and cached rows must be budget-free, read-only, exact-origin', async () => {
+test('policy table: public rows must be budget-free, read-only, exact-origin', async () => {
   const base = DEFAULT_CLIENTS.publicSessions[0];
   const bad = [
     { ...base, fillPolicy: 'default' },
@@ -2074,7 +1987,6 @@ test('policy table: public and cached rows must be budget-free, read-only, exact
     { ...base, origins: ['https://poke-guide.com/'] },
     { ...base, origins: ['http://poke-guide.com'] },
     { ...base, origins: ['chrome-extension://'] },
-    { ...base, cache: { 'catalog:tags': 60 } },
     { ...base, quota: { daily: null, perMinute: 1, perMinuteBinding: null } },
   ];
   for (const row of bad) {
@@ -2082,10 +1994,6 @@ test('policy table: public and cached rows must be budget-free, read-only, exact
     try { assertValidClients({ ...DEFAULT_CLIENTS, publicSessions: [row] }); } catch { threw = true; }
     ok(threw, JSON.stringify(row).slice(0, 80));
   }
-  let threw = false;
-  const cachingApp = { id: 'x', auth: 'app-key', keySha256: '0'.repeat(64), routes: ['pricing:games'], fillPolicy: 'default', quota: {}, origins: [], cache: { 'pricing:games': 60 } };
-  try { assertValidClients({ ...DEFAULT_CLIENTS, appKeys: [cachingApp] }); } catch { threw = true; }
-  ok(threw, 'a client that may spend budget may not share the edge cache');
 });
 
 // ---------- runner ----------

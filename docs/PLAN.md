@@ -3,8 +3,8 @@
 **Status:** plan, agreed in principle 2026-11-08; open points settled
 2026-11-09 (section 11). Built and tested offline, nothing deployed: G0, G1,
 the gateway half of G2 (`/pricing/v1/health` open), the Worker half of G4
-(Access service-token headers) and the Worker half of G5 (sessions, edge cache,
-per-item quote cache), each on its own `feature/g<n>-…` branch, all merged
+(Access service-token headers) and the Worker half of G5 (sessions; its edge
+and quote caches were later removed, decision 26), each on its own `feature/g<n>-…` branch, all merged
 into `dev`. The Cloudflare token `tcg-api-gateway` has its permissions and is
 in Bitwarden (`api-gateway`); deploys need the `owner-ops` machine token on the
 PC. Still outside code: G2's alert repoint (after deploy), G4's Zero Trust
@@ -28,8 +28,10 @@ Why one front door:
 - **The services stay simple and private.** Pricing and catalog keep their one
   shared app token each and never learn about licence keys, browsers, or
   quotas. They accept traffic only from this Worker.
-- **Edge caching.** Cacheable reads are answered from Cloudflare's cache, so
-  most public traffic never reaches the single small Droplet.
+- **Pass-through, never a cache.** The gateway controls access and
+  throughput only; every allowed request goes to its service and the answer
+  comes back unchanged (decision 26). If origin load ever matters, the
+  services set their own `Cache-Control` and Cloudflare caches on that.
 - **It already mostly exists.** `sourcery/gateway` already does route
   allow-listing, service-token injection, CORS, per-key quotas, Polar licence
   validation, and per-tier `x-fill-policy`. This repo generalises that code
@@ -138,14 +140,13 @@ reviewed like code; credentials live in Bitwarden (section 7). A policy says:
 - `quota`: per-day and per-minute limits, and what they are keyed on (licence
   key, app key, or IP)
 - `origins`: allowed browser `Origin` prefixes (CORS), if any
-- `cache`: whether, and for how long, responses may be served from the edge cache
 
 ### Who needs access
 
 | Client | Today | Kind | Auth | Allowed | Fill policy | Notes |
 |---|---|---|---|---|---|---|
 | **Sourcery extension** | Live, via `sourcery/gateway` | Browser extension, paid | `license`: Polar licence key + `X-Instance-Id`, verdict cached in KV (unchanged) | quote, products lookup/get, both games lists, licence routes | by tier: `basic:none`, `pro:default` (unchanged) | Origins `chrome-extension://`, `moz-extension://`. Quotas per key as today (`DAILY_QUOTA=20000`, `BURST_PER_MINUTE=300`). |
-| **poke-guide website** (poke-guide.com) | Reads static snapshots from R2 (`data.poke-guide.com`) | Public static site | `public-session` (section 6.3) | Reads only: `POST pricing/v1/prices/quote` (fill policy forced to `none`, **max 100 items per call**), and GET `pricing/v1/prices/product/:id`, `pricing/v1/history*`, `pricing/v1/games`; `catalog/v1/manifest.json`, `catalog/v1/artifacts/*`, `catalog/v1/images/*`, `catalog/v1/products/*`, `catalog/v1/games` | **`none`, forced** | Origins `https://poke-guide.com` (+ preview origin). Per-IP limits. Edge-cached. Migration is the poke_guide huddle. |
+| **poke-guide website** (poke-guide.com) | Reads static snapshots from R2 (`data.poke-guide.com`) | Public static site | `public-session` (section 6.3) | Reads only: `POST pricing/v1/prices/quote` (fill policy forced to `none`, **max 100 items per call**), and GET `pricing/v1/prices/product/:id`, `pricing/v1/history*`, `pricing/v1/games`; `catalog/v1/manifest.json`, `catalog/v1/artifacts/*`, `catalog/v1/images/*`, `catalog/v1/products/*`, `catalog/v1/games` | **`none`, forced** | Origins `https://poke-guide.com` (+ preview origin). Per-IP limits. Migration is the poke_guide huddle. |
 | **Server-side apps**: poke-scans backend, Binder_v2 backend, ops tools, monitors | All point at `localhost:8430/8440` today | Code that can keep a secret | `app-key`: one key per app, `Authorization: Bearer <key>` | per app, least privilege | per app (`default` only where the app genuinely needs per-condition fills) | Keys stored hashed (SHA-256) in the policy table, plaintext only in Bitwarden. |
 | **Browser apps of our own**: Binder web, poke-scans frontend | localhost today | Public code | `public-session`, own client id and origins | per app | `none` unless proxied through that app's own backend | Anything that must spend JustTCG budget goes through a backend with an app key, never straight from a browser. |
 | **Binder mobile** | localhost today | Native app, public code | **Open question**: Turnstile is web-only. Options: route through Binder_v2 backend (app key), or a per-install token like Sourcery's activation. | — | `none` | Decide before mobile ships against production. |
@@ -191,14 +192,15 @@ appears.
    flushed in batches as `sourcery/gateway` does today. If the plan turns out
    to be the free one and the daily counters prove too write-heavy, revisit
    then. Over quota -> 429 with `Retry-After`.
-5. Serve from the edge cache if the policy allows it and there is a fresh hit.
+5. (Removed by decision 26: the gateway never answers from a cache.)
 6. Forward: strip **every** client header except `content-type` and `accept`
    (as today), then add `CF-Access-Client-Id`, `CF-Access-Client-Secret`,
    `x-app-token` for that service, and, on **every** pricing request (not
    only quotes, since pricing treats an absent header as `default`),
    `x-fill-policy` from the policy. Body size cap of 1 MB (as today). The
    Access headers are added at G4.
-7. Copy back only status, `content-type`, body, `ETag` and caching headers.
+7. Copy back only status, `content-type`, body, `ETag` and the origin's own
+   `Cache-Control`, unchanged.
    Add CORS headers for an allowed `Origin`.
 
 ### 6.2 Licence keys (Sourcery)
@@ -240,12 +242,9 @@ access **harmless and bounded**, and makes it costly to abuse:
    the client sends, and a quote batch capped at **100 items** for public
    clients (`413 {error:"batch_too_large", max:100}` above that) so one call can't do the work of a
    scrape. Public traffic can never spend JustTCG budget or write anything.
-5. **Edge caching.** `catalog/v1/artifacts/*` are content-hashed and
-   immutable, so cache them for a year. Cache `prices/product/:id`, games and
-   history GETs for about 1 hour. Quote is a POST batch, so the Worker splits
-   it and caches each item under a synthetic GET key
-   `(game, productId|skuId, condition, printing)` for about 1 hour, forwarding
-   only the misses.
+5. **No gateway caching** (decision 26). Public responses, quotes included,
+   are forwarded on every call and returned exactly as the service sent
+   them; the gateway never caches, splits or merges a quote batch.
 
 Exposure check: everything a public client can read is already published
 openly today (R2's `pricing/prices.json` and `catalog/pokemon.json`, and
@@ -306,7 +305,7 @@ Unchanged and not the gateway's concern: `JUSTTCG_API_KEY`
 
 Non-secret configuration (`wrangler.toml` `[vars]`): `PRICING_ORIGIN`,
 `CATALOG_ORIGIN`, `POLAR_*`, `ALLOWED_ORIGIN_PREFIXES` per client (or folded
-into `src/clients.js`), quota defaults, cache TTLs, Turnstile **site** keys.
+into `src/clients.js`), quota defaults, Turnstile **site** keys.
 Cloudflare account `722b682d1c0bb958ea4d14b5bc6275d1`; KV namespace
 `LICENSES` (`3216419ee1244988a05fc0bad9d7b17c`) carries over so cached
 Sourcery verdicts survive the cut-over.
@@ -365,7 +364,7 @@ only fixes the names and fields it will key on.
 | G2 | `GET /pricing/v1/health` open through the gateway; pricing's freshness alert repointed to it. | gateway, pricing | Alert workflow green against the gateway URL. |
 | G3 | Cut `api.dyzzyscards.com` over from `sourcery-gateway` to `tcg-api-gateway`; push secrets. The custom-domain detach (old Worker) and reattach (new Worker) run as **one scripted step**; a gap of seconds to a minute is acceptable (Sourcery is the only live client and retries). The script ends by preparing G4: it creates the Access app and service token and pushes `ACCESS_CLIENT_ID` and `ACCESS_CLIENT_SECRET` as Worker secrets. **Build gate:** `POLAR_API_BASE` points at Polar production, not sandbox, before cut-over (sandbox licences can be obtained with test card numbers). **Stop at that step for the owner's go-ahead.** | gateway | Sourcery's deployed e2e passes 8/8 through the new Worker (`F:/claude_temp/poke-scans/sourcery-e2e-deployed.py`). |
 | G4 | **Immediately after G3**, with no other step or work between them. Lock origins with Access (section 4). Until this lands, `pricing-origin.dyzzyscards.com` and `catalog-origin.dyzzyscards.com` are directly reachable and bypass every gateway check. The lock waits for the owner's go-ahead; the Access prep above has already run. | gateway (+ Cloudflare) | Direct origin curl is denied; e2e still 8/8; freshness alert still green. |
-| G5 | Public sessions: Turnstile, per-IP limits, edge cache, per-item quote cache. | gateway | Tests; a load test shows cached hits never reaching the origin. |
+| G5 | Public sessions: Turnstile, per-IP limits, forced fill policy, batch cap. | gateway | Tests; a load test shows public traffic held to its per-IP and per-session limits. |
 | G6 | poke-guide switches from R2 snapshots to the gateway (huddle with `_apps/poke_guide`). | poke_guide, gateway | poke-guide.com search and prices work with R2 unused. |
 | G7 | Sourcery extension moves to the new paths; aliases removed once their hit counts reach zero; `sourcery/gateway` retired. | sourcery, gateway | No alias hits for 30 days. |
 | G8 | Retire the R2 publisher (`pricing-publisher` and `tools/poke-guide/` in pricing) once nothing reads R2. **Decide first** whether R2 stays as the off-Droplet backup of `prices.db`/`history.db`, or is replaced by DigitalOcean volume snapshots. | pricing | No R2 reads in Cloudflare analytics for 14 days. |
@@ -454,7 +453,7 @@ sections above):
     expires in `SESSION_TTL_SECONDS` (1800). Sending any `Authorization` to
     `POST /v1/session` is checked like everywhere else (decision 3), so sites
     must not send the old token there.
-13. Edge cache TTLs: artifacts 1 year, images 1 day, manifest 60 s, all else
+13. *(Superseded by decision 26.)* Edge cache TTLs: artifacts 1 year, images 1 day, manifest 60 s, all else
     1 hour. Only `fillPolicy: none` clients may use the shared edge cache
     (enforced by `assertValidClients`). Quote items are cached only when they
     carry nothing but `game`, exactly one of `productId`/`skuId`, `condition`,
@@ -495,7 +494,7 @@ sections above):
 
 **2026-11-09, security review fixes (branch `fix/security-review-findings`):**
 
-19. **Quote cache keys are exact.** Per-item quote cache entries are keyed
+19. *(Superseded by decision 26.)* **Quote cache keys are exact.** Per-item quote cache entries are keyed
     on the exact `game` / `condition` / `printing` pricing receives (pricing
     matches `game` verbatim). An item whose selector is present but not
     canonical (`game` `^[a-z0-9-]{1,64}$`; condition/printing words of
@@ -524,3 +523,20 @@ sections above):
 25. **Tag-write keys.** The `catalog:tags.write` segment allows the `<file>`
     characters plus percent-escapes that cannot decode to `/`, `\`, `.` or a
     control character, with no leading dot.
+
+**2026-11-09, pass-through (owner decision):**
+
+26. **The gateway is a gatekeeper, not a cache.** Owner: "You control access
+    and throughput, everything else passes through to the proper service
+    unadulterated." The gateway decides who gets in, which routes and how
+    often (auth, policy, quotas, rate limits, body and batch caps, CORS,
+    forced `x-fill-policy`), then forwards. It never caches, splits, merges
+    or rewrites a service response body, and sets no `Cache-Control` or
+    `X-Gateway-Cache` of its own. Two deliberate exceptions, both to avoid
+    leaking origin internals: an origin 5xx becomes `502 origin_unavailable`,
+    and only `content-type`, `etag` and `cache-control` headers are passed back.
+    Otherwise: the edge cache, the per-item quote cache and
+    the policy `cache` field are removed. Supersedes decisions 13 and 19. If
+    origin load ever matters, the services set their own `Cache-Control` and
+    Cloudflare caches on that; the gateway stays blind to it. Licence
+    verdict caching is the gateway's own auth state and is unchanged.
