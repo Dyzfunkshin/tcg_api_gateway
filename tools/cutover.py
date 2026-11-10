@@ -7,8 +7,8 @@ Usage (from a venv with bitwarden-sdk, as owner via owner-ops):
 
 Steps, in order:
   a. preflight (read-only): POLAR_API_BASE is Polar production; the tcg-api-gateway
-     script exists; api.dyzzyscards.com is a Workers Custom Domain on sourcery-gateway
-     (or already on tcg-api-gateway). A zone Worker route instead stops the run.
+     script exists; api.dyzzyscards.com and api.mintuition.app are each a Custom Domain on
+     sourcery-gateway (move), already on tcg-api-gateway (skip) or, for mintuition only, unattached (attach). A zone Worker route instead stops the run.
   b. G3 go-ahead, then push PRICING_APP_TOKEN and CATALOG_APP_TOKEN (tools/push_secrets.py).
   c. Detach the domain from sourcery-gateway and attach it to
      tcg-api-gateway as one step; if the attach fails it is re-attached to sourcery-gateway.
@@ -26,10 +26,13 @@ import tomllib
 import urllib.parse
 
 import push_secrets
-from cloudflare_api import ACCOUNT_ID, WORKER_NAME, ZONE_NAME, CloudflareError
+from cloudflare_api import ACCOUNT_ID, WORKER_NAME, CloudflareError
 from push_secrets import API_GATEWAY_PROJECT_ID, SecretStoreError
 
-CUSTOM_DOMAIN = "api.dyzzyscards.com"
+# (hostname, zone name), in cut-over order (PLAN.md section 11, decision 28).
+CUSTOM_DOMAINS = [("api.dyzzyscards.com", "dyzzyscards.com"), ("api.mintuition.app", "mintuition.app")]
+# Hosts that may be attached fresh when on no Worker (api.dyzzyscards.com must already exist).
+ATTACH_IF_UNATTACHED = {"api.mintuition.app"}
 OLD_WORKER = "sourcery-gateway"
 POLAR_PRODUCTION = "https://api.polar.sh"
 APP_TOKEN_SECRETS = ["PRICING_APP_TOKEN", "CATALOG_APP_TOKEN"]
@@ -86,8 +89,39 @@ def confirm(phrase: str, input_fn) -> None:
 
 # a. Preflight -------------------------------------------------------------------------
 
-def preflight(cloudflare, variables: dict) -> dict:
-    """Read-only checks; returns the domain's Custom Domain record. Raises CutoverStop."""
+def check_host(cloudflare, hostname: str, zone_name: str) -> dict:
+    """Read-only decision for one hostname: {hostname, action: skip|move|attach, record, zone_id}."""
+    records = [d for d in cloudflare.get(f"{DOMAINS_PATH}?hostname={hostname}") or []
+               if d.get("hostname") == hostname]
+    if len(records) > 1:
+        raise CutoverStop(f"{len(records)} Custom Domain records for {hostname}; resolve by hand")
+    if records:
+        service = records[0].get("service")
+        if service == WORKER_NAME:
+            print(f"ok   {hostname} is already a Custom Domain on {service}")
+            return {"hostname": hostname, "action": "skip", "record": records[0], "zone_id": records[0].get("zone_id")}
+        if service == OLD_WORKER:
+            print(f"ok   {hostname} is a Custom Domain on {service}; will move")
+            return {"hostname": hostname, "action": "move", "record": records[0], "zone_id": records[0].get("zone_id")}
+        raise CutoverStop(f"{hostname} is a Custom Domain on unexpected Worker {service}; not touching it")
+
+    zones = cloudflare.get(f"/zones?name={zone_name}") or []
+    if len(zones) != 1:
+        raise CutoverStop(f"{hostname} is not a Custom Domain and zone {zone_name} is not readable")
+    routes = cloudflare.get(f"/zones/{zones[0]['id']}/workers/routes") or []
+    matching = [r for r in routes if str(r.get("pattern", "")).split("/")[0] == hostname]
+    if matching:
+        found = ", ".join(f"{r.get('pattern')} -> {r.get('script')}" for r in matching)
+        raise CutoverStop(f"{hostname} is attached as a zone Worker route ({found}), not a Custom Domain; "
+                          "this script only moves Custom Domains. Move it by hand or update the plan.")
+    if hostname in ATTACH_IF_UNATTACHED:
+        print(f"ok   {hostname} is attached to no Worker; will attach to {WORKER_NAME} in zone {zone_name}")
+        return {"hostname": hostname, "action": "attach", "record": None, "zone_id": zones[0]["id"]}
+    raise CutoverStop(f"{hostname} is not attached to any Worker; not guessing")
+
+
+def preflight(cloudflare, variables: dict) -> list[dict]:
+    """Read-only checks; returns one plan entry per hostname. Raises CutoverStop."""
     ok, message = polar_gate(variables)
     print(f"{'ok  ' if ok else 'FAIL'} {message}")
     if not ok:
@@ -98,51 +132,65 @@ def preflight(cloudflare, variables: dict) -> dict:
         raise CutoverStop(f"Worker script {WORKER_NAME} does not exist; deploy it first")
     print(f"ok   Worker script {WORKER_NAME} exists")
 
-    records = [d for d in cloudflare.get(f"{DOMAINS_PATH}?hostname={CUSTOM_DOMAIN}") or []
-               if d.get("hostname") == CUSTOM_DOMAIN]
-    if len(records) > 1:
-        raise CutoverStop(f"{len(records)} Custom Domain records for {CUSTOM_DOMAIN}; resolve by hand")
-    if records:
-        service = records[0].get("service")
-        if service in (OLD_WORKER, WORKER_NAME):
-            print(f"ok   {CUSTOM_DOMAIN} is a Custom Domain on {service}")
-            return records[0]
-        raise CutoverStop(f"{CUSTOM_DOMAIN} is a Custom Domain on unexpected Worker {service}; not touching it")
-
-    zones = cloudflare.get(f"/zones?name={ZONE_NAME}") or []
-    if len(zones) != 1:
-        raise CutoverStop(f"{CUSTOM_DOMAIN} is not a Custom Domain and zone {ZONE_NAME} is not readable")
-    routes = cloudflare.get(f"/zones/{zones[0]['id']}/workers/routes") or []
-    matching = [r for r in routes if str(r.get("pattern", "")).split("/")[0] == CUSTOM_DOMAIN]
-    if matching:
-        found = ", ".join(f"{r.get('pattern')} -> {r.get('script')}" for r in matching)
-        raise CutoverStop(f"{CUSTOM_DOMAIN} is attached as a zone Worker route ({found}), not a Custom Domain; "
-                          "this script only moves Custom Domains. Move it by hand or update the plan.")
-    raise CutoverStop(f"{CUSTOM_DOMAIN} is not attached to any Worker; not guessing")
+    return [check_host(cloudflare, hostname, zone_name) for hostname, zone_name in CUSTOM_DOMAINS]
 
 
 # c. G3 domain move --------------------------------------------------------------------
 
-def attach(cloudflare, service: str, zone_id: str) -> None:
-    cloudflare.put(DOMAINS_PATH, {"hostname": CUSTOM_DOMAIN, "service": service,
-                                  "zone_id": zone_id})
+def attach(cloudflare, hostname: str, service: str, zone_id: str):
+    return cloudflare.put(DOMAINS_PATH, {"hostname": hostname, "service": service, "zone_id": zone_id})
 
 
-def move_domain(cloudflare, record: dict) -> None:
-    """Detach from sourcery-gateway and attach to tcg-api-gateway; roll back if the attach fails."""
-    cloudflare.delete(f"{DOMAINS_PATH}/{record['id']}")
-    print(f"detached {CUSTOM_DOMAIN} from {OLD_WORKER}")
-    try:
-        attach(cloudflare, WORKER_NAME, record["zone_id"])
-    except CloudflareError as error:
-        print(f"attach to {WORKER_NAME} failed: {error}", file=sys.stderr)
+def apply_domains(cloudflare, entries: list[dict]) -> None:
+    """Move/attach every host that needs it; if one fails, put back the ones this run already changed."""
+    done = []  # [entry, state, new record id]; state: detached | moved | attached
+    for entry in entries:
+        hostname = entry["hostname"]
+        if entry["action"] == "skip":
+            print(f"skip     {hostname} is already on {WORKER_NAME}")
+            continue
         try:
-            attach(cloudflare, OLD_WORKER, record["zone_id"])
+            if entry["action"] == "move":
+                cloudflare.delete(f"{DOMAINS_PATH}/{entry['record']['id']}")
+                print(f"detached {hostname} from {OLD_WORKER}")
+                done.append([entry, "detached", None])
+            created = attach(cloudflare, hostname, WORKER_NAME, entry["zone_id"])
+            if entry["action"] == "move":
+                done[-1][1:] = ["moved", (created or {}).get("id")]
+            else:
+                done.append([entry, "attached", (created or {}).get("id")])
+            print(f"attached {hostname} to {WORKER_NAME}")
+        except CloudflareError as error:
+            print(f"attach of {hostname} to {WORKER_NAME} failed: {error}", file=sys.stderr)
+            raise CutoverStop(rollback_domains(cloudflare, done)) from None
+
+
+def rollback_domains(cloudflare, done: list) -> str:
+    """Put every host this run changed back where it was; returns the report message."""
+    notes, stuck = [], []
+
+    def detach_current(hostname, known_id):
+        current = known_id or next((d["id"] for d in cloudflare.get(f"{DOMAINS_PATH}?hostname={hostname}") or []
+                                    if d.get("hostname") == hostname), None)
+        if current:
+            cloudflare.delete(f"{DOMAINS_PATH}/{current}")
+
+    for entry, state, new_id in reversed(done):
+        hostname = entry["hostname"]
+        try:
+            if state in ("moved", "attached"):
+                detach_current(hostname, new_id)
+            if entry["action"] == "move":
+                attach(cloudflare, hostname, OLD_WORKER, entry["zone_id"])
+                notes.append(f"{hostname} is on {OLD_WORKER} again")
+            else:
+                notes.append(f"{hostname} is detached again (as it was)")
         except CloudflareError as rollback_error:
-            raise CutoverStop(f"attach failed AND rollback failed ({rollback_error}): {CUSTOM_DOMAIN} is "
-                              f"attached to NO Worker; re-attach it to {OLD_WORKER} in the dashboard now") from None
-        raise CutoverStop(f"attach failed; rolled back: {CUSTOM_DOMAIN} is on {OLD_WORKER} again") from None
-    print(f"attached {CUSTOM_DOMAIN} to {WORKER_NAME}")
+            stuck.append(f"{hostname} ({rollback_error})")
+    if stuck:
+        return ("attach failed AND rollback failed for " + ", ".join(stuck) + ": those hosts are attached to "
+                f"NO Worker (or the wrong one); fix in the dashboard now (moved hosts belong on {OLD_WORKER})")
+    return "attach failed; rolled back: " + "; ".join(notes)
 
 
 # d. G4 prep ---------------------------------------------------------------------------
@@ -219,10 +267,14 @@ def print_plan(variables: dict) -> None:
     print("plan (nothing contacted; --preflight runs the read-only checks, --apply runs everything):")
     print(f"  a. preflight  [{'ok' if ok else 'WILL REFUSE'}] {message}")
     print(f"                GET {A}/workers/scripts  ({WORKER_NAME} exists)")
-    print(f"                GET {DOMAINS_PATH}?hostname={CUSTOM_DOMAIN}  (on {OLD_WORKER}; a zone route stops the run)")
+    for hostname, zone_name in CUSTOM_DOMAINS:
+        print(f"                GET {DOMAINS_PATH}?hostname={hostname}  (on {OLD_WORKER}: move; on {WORKER_NAME}: skip; "
+              f"zone {zone_name}; a zone route or other Worker stops the run)")
     print(f"  b. G3         stop for '{G3_PHRASE}'; PUT {push_secrets.SECRETS_PATH}  {', '.join(APP_TOKEN_SECRETS)}")
-    print(f"  c. G3         DELETE {DOMAINS_PATH}/<id> ({OLD_WORKER}), "
-          f"PUT {DOMAINS_PATH} ({WORKER_NAME}); on failure PUT back to {OLD_WORKER}")
+    names = " and ".join(h for h, _ in CUSTOM_DOMAINS)
+    print(f"  c. G3         for {names}: DELETE {DOMAINS_PATH}/<id> ({OLD_WORKER}), "
+          f"PUT {DOMAINS_PATH} ({WORKER_NAME}); an unattached api.mintuition.app is only attached; "
+          f"on failure both hosts are put back where they were")
     print(f"  d. G4 prep    POST {TOKENS_PATH} ({SERVICE_TOKEN_NAME}); store {ACCESS_ID_KEY}, {ACCESS_SECRET_KEY} "
           f"in Bitwarden; PUT {push_secrets.SECRETS_PATH} ACCESS_CLIENT_ID, ACCESS_CLIENT_SECRET")
     print(f"  e. G4 lock    stop for '{G4_PHRASE}'; POST {POLICIES_PATH} (non_identity, that token only); "
@@ -231,18 +283,15 @@ def print_plan(variables: dict) -> None:
 
 def run(cloudflare, store, variables: dict, input_fn) -> None:
     hosts = origin_hosts(variables)
-    record = preflight(cloudflare, variables)
+    entries = preflight(cloudflare, variables)
 
-    domain_done = record.get("service") == WORKER_NAME
+    domain_done = all(e["action"] == "skip" for e in entries)
     if not domain_done:
         confirm(G3_PHRASE, input_fn)
     failed = push_secrets.push(cloudflare, store, APP_TOKEN_SECRETS)
     if failed:
         raise CutoverStop(f"app tokens not pushed ({', '.join(failed)}); domain not moved")
-    if domain_done:
-        print(f"skip     {CUSTOM_DOMAIN} is already on {WORKER_NAME}")
-    else:
-        move_domain(cloudflare, record)
+    apply_domains(cloudflare, entries)
 
     token_id = prepare_service_token(cloudflare, store)
     failed = push_secrets.push(cloudflare, store, list(push_secrets.ACCESS_PAIR))

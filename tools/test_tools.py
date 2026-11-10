@@ -63,13 +63,16 @@ class FakeStore:
 class FakeCloudflare:
     """A stateful fake of the Cloudflare endpoints the tools use; records every call."""
 
-    def __init__(self, events, *, domain_service="sourcery-gateway", route=False, fail=()):
+    def __init__(self, events, *, domain_service="sourcery-gateway", mintuition_service=None, route=False, fail=()):
         self.events = events
         self.calls = []
         self.fail = set(fail)  # (method, path, service-or-None) tuples to fail with HTTP 500
         self.scripts = ["sourcery-gateway", "tcg-api-gateway"]
         self.domains = ([{"id": "dom1", "hostname": "api.dyzzyscards.com", "service": domain_service,
                           "zone_id": "zone1", "environment": "production"}] if domain_service else [])
+        if mintuition_service:  # api.mintuition.app (zone2); attached to nothing unless a test says so
+            self.domains.append({"id": "dom2", "hostname": "api.mintuition.app", "service": mintuition_service,
+                                 "zone_id": "zone2"})
         self.routes = [{"id": "r1", "pattern": "api.dyzzyscards.com/*", "script": "sourcery-gateway"}] if route else []
         self.worker_secrets = {}
         self.tokens, self.policies, self.apps = [], [], []
@@ -107,9 +110,13 @@ class FakeCloudflare:
             self.domains = [d for d in self.domains if d["id"] != bare.rsplit("/", 1)[1]]
             return None
         if (method, bare) == ("GET", "/zones"):
-            return [{"id": "zone1", "name": "dyzzyscards.com"}]
+            zones = [{"id": "zone1", "name": "dyzzyscards.com"}, {"id": "zone2", "name": "mintuition.app"}]
+            name = urllib.parse.parse_qs(query).get("name", [None])[0]
+            return [z for z in zones if name in (None, z["name"])]
         if (method, bare) == ("GET", "/zones/zone1/workers/routes"):
             return self.routes
+        if (method, bare) == ("GET", "/zones/zone2/workers/routes"):
+            return []
         if (method, bare) == ("GET", secrets_path):
             return [{"name": n, "type": "secret_text"} for n in self.worker_secrets]
         if (method, bare) == ("PUT", secrets_path):
@@ -296,7 +303,8 @@ class CutoverTests(unittest.TestCase):
     def test_full_run_moves_domain_and_locks_in_order(self):
         h = Harness()
         self.assertEqual(h.cutover(), 0, h.stderr)
-        self.assertEqual([d["service"] for d in h.cf.domains], ["tcg-api-gateway"])
+        self.assertEqual(sorted((d["hostname"], d["service"]) for d in h.cf.domains),
+                         [("api.dyzzyscards.com", "tcg-api-gateway"), ("api.mintuition.app", "tcg-api-gateway")])
         self.assertEqual(set(h.cf.worker_secrets), {"PRICING_APP_TOKEN", "CATALOG_APP_TOKEN",
                                                    "ACCESS_CLIENT_ID", "ACCESS_CLIENT_SECRET"})
         self.assertEqual(h.cf.worker_secrets["ACCESS_CLIENT_SECRET"], ACCESS_CLIENT_SECRET)
@@ -329,6 +337,43 @@ class CutoverTests(unittest.TestCase):
         self.assertEqual(h.cf.tokens, [])
         self.assertNotIn("ACCESS_CLIENT_ID", h.cf.worker_secrets)
         self.assertEqual(h.cf.apps, [])
+
+    # --- cr:serve-api-mintuition-app-alongside-api (task #11) ---
+    def test_plan_mode_lists_both_hostnames(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cutover.main([], open_store=unreachable, open_cloudflare=unreachable,
+                         input_fn=unreachable, variables=PRODUCTION_VARS)
+        self.assertIn("api.dyzzyscards.com", out.getvalue())
+        self.assertIn("api.mintuition.app", out.getvalue())
+
+    def test_mintuition_attached_nowhere_is_attached_in_its_own_zone(self):
+        h = Harness()
+        self.assertEqual(h.cutover(), 0, h.stderr)
+        mint = [d for d in h.cf.domains if d["hostname"] == "api.mintuition.app"]
+        self.assertEqual([(d["service"], d["zone_id"]) for d in mint], [("tcg-api-gateway", "zone2")])
+        self.assertFalse(any(m == "DELETE" and "/workers/domains/dom2" in p for m, p, _ in h.cf.calls))
+
+    def test_mintuition_on_old_worker_is_moved(self):
+        h = Harness(mintuition_service="sourcery-gateway")
+        self.assertEqual(h.cutover(), 0, h.stderr)
+        self.assertEqual({d["service"] for d in h.cf.domains}, {"tcg-api-gateway"})
+        self.assertEqual(len(h.cf.domains), 2)
+
+    def test_mintuition_on_unexpected_worker_stops_before_mutating(self):
+        h = Harness(mintuition_service="some-other-worker")
+        self.assertEqual(h.cutover(), 1)
+        self.assertIn("api.mintuition.app", h.stderr)
+        self.assertEqual(h.cf.mutations(), [])
+
+    def test_rerun_after_both_moved_changes_nothing_on_domains(self):
+        h = Harness()
+        self.assertEqual(h.cutover(), 0, h.stderr)
+        before = [c for c in h.cf.mutations() if "/workers/domains" in c[1]]
+        h.answers = []
+        h.cutover()
+        after = [c for c in h.cf.mutations() if "/workers/domains" in c[1]]
+        self.assertEqual(before, after)
 
     def test_route_not_custom_domain_stops(self):
         h = Harness(domain_service=None, route=True)
@@ -365,7 +410,8 @@ class CutoverTests(unittest.TestCase):
     def test_g4_phrase_mismatch_creates_no_lock(self):
         h = Harness(answers=[G3, "lock"])
         self.assertEqual(h.cutover(), 1)
-        self.assertEqual([d["service"] for d in h.cf.domains], ["tcg-api-gateway"])
+        self.assertEqual(sorted((d["hostname"], d["service"]) for d in h.cf.domains),
+                         [("api.dyzzyscards.com", "tcg-api-gateway"), ("api.mintuition.app", "tcg-api-gateway")])
         self.assertEqual(h.cf.policies, [])
         self.assertEqual(h.cf.apps, [])
 

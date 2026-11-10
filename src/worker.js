@@ -218,7 +218,7 @@ async function polarCallAllowed(op, logTag, env, deps) {
 // Second layer (2026-11-07): the colo's edge cache (Cache API), which has no daily write limit,
 // so a fresh isolate in the same colo finds the verdict without a Polar call even while KV
 // refuses writes. Keyed by a synthetic URL; absent in node (tests) and on error.
-const VERDICT_CACHE_URL = 'https://verdicts.sourcery.invalid/';
+const VERDICT_CACHE_URL = 'https://verdicts.mintuition.invalid/';
 function edgeCache() {
   try { return typeof caches !== 'undefined' && caches.default ? caches.default : null; } catch (error) { return null; }
 }

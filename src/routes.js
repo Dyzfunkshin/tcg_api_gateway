@@ -48,7 +48,7 @@ export const SERVICE_ROUTES = Object.freeze([
 
 export const ROUTE_IDS = Object.freeze(new Set([...GATEWAY_ROUTES, ...SERVICE_ROUTES].map((r) => r.id)));
 
-// Legacy aliases (PLAN.md section 3): the paths installed Sourcery extensions call today,
+// Legacy aliases (PLAN.md section 3): the paths installed Mintuition extensions call today,
 // rewritten onto the namespaced scheme. Removed at G7 once their logged hits reach zero.
 const LEGACY_ALIASES = Object.freeze([
   [/^\/v1\/prices\/quote$/, () => '/pricing/v1/prices/quote'],
