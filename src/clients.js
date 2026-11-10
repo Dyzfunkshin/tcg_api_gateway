@@ -36,9 +36,9 @@ export const ANONYMOUS_CLIENT = Object.freeze({
   origins: Object.freeze([]),
 });
 
-// The Sourcery browser extension, authenticated by a Polar licence key + X-Instance-Id.
+// The Mintuition browser extension, authenticated by a Polar licence key + X-Instance-Id.
 export const LICENSE_CLIENT = Object.freeze({
-  id: 'sourcery',
+  id: 'mintuition',
   auth: 'license',
   routes: Object.freeze([
     ...OPEN_ROUTES,

@@ -1,4 +1,4 @@
-// Sourcery gateway tests. Plain node:assert, no dependencies.
+// Mintuition gateway tests. Plain node:assert, no dependencies.
 // Run: node gateway/test/run.js   (exits non-zero on any failure)
 import assert from 'node:assert/strict';
 import { handle, licenseKeyFrom, corsHeaders, corsOriginsOf, quotaKeys, resetQuotaMemory, ipLimiterKey } from '../src/worker.js';
@@ -607,7 +607,7 @@ test('log quota_exceeded: a daily refusal logs once with the key hash prefix, ne
   eq((await w.send('/v1/license', { headers: { 'cf-connecting-ip': '5.5.5.5' } })).status, 429);
   const events = eventsNamed(w, 'quota_exceeded');
   eq(events.length, 1);
-  eq([events[0].client, events[0].subjectKind, events[0].subject.length, events[0].ip], ['sourcery', 'license', 8, '5.5.5.5']);
+  eq([events[0].client, events[0].subjectKind, events[0].subject.length, events[0].ip], ['mintuition', 'license', 8, '5.5.5.5']);
   ok(!JSON.stringify(w.logs).includes(KEY));
 });
 
@@ -1337,14 +1337,14 @@ test('anonymous client: open routes only; data routes are 401 credential_require
   eq(w.calls.length, 0);
 });
 
-test('legacy aliases still work for Sourcery and each hit is logged', async () => {
+test('legacy aliases still work for Mintuition and each hit is logged', async () => {
   const w = createWorld();
   eq((await w.send('/v1/prices/quote', { method: 'POST', body: [] })).status, 200);
   eq(lastUpstream(w, PRICING).url, PRICING + '/v1/prices/quote');
   eq((await w.send('/v1/products/5')).status, 200);
   eq(lastUpstream(w, CATALOG).url, CATALOG + '/v1/products/5');
   const aliasLogs = w.logs.filter(([event]) => event === 'legacy_alias').map(([, f]) => [f.path, f.route, f.client]);
-  eq(aliasLogs, [['/v1/prices/quote', 'pricing:quote', 'sourcery'], ['/v1/products/5', 'catalog:products.get', 'sourcery']]);
+  eq(aliasLogs, [['/v1/prices/quote', 'pricing:quote', 'mintuition'], ['/v1/products/5', 'catalog:products.get', 'mintuition']]);
   eq((await w.send('/pricing/v1/prices/quote', { method: 'POST', body: [] })).status, 200);
   eq(w.logs.filter(([event]) => event === 'legacy_alias').length, 2, 'namespaced paths are not alias hits');
 });
@@ -1426,7 +1426,7 @@ test('log rate_limited: the in-memory per-minute refusal logs once with limiter 
   eq((await w.send('/v1/license')).status, 429);
   const events = eventsNamed(w, 'rate_limited');
   eq(events.length, 1);
-  eq([events[0].client, events[0].limiter, events[0].subjectKind, events[0].subject.length], ['sourcery', 'memory', 'license', 8]);
+  eq([events[0].client, events[0].limiter, events[0].subjectKind, events[0].subject.length], ['mintuition', 'memory', 'license', 8]);
 });
 
 test('rate-limiting binding: decides per-minute limits when present, keyed per licence key', async () => {
@@ -1489,7 +1489,7 @@ test('policy table: the shipped table is valid; malformed rows are rejected', as
     { ...app, fillPolicy: 'by-license-tier' },
     { ...app, keySha256: 'not-a-hash' },
     { ...app, routes: ['gateway:license'] },
-    { ...app, id: 'sourcery' },
+    { ...app, id: 'mintuition' },
   ];
   for (const row of bad) {
     let threw = false;
@@ -1998,6 +1998,22 @@ test('CORS: site origins match exactly, extension schemes by prefix', async () =
   eq(corsHeaders('https://poke-guide.com.evil.example', origins), {});
   eq(corsHeaders('https://poke-guide.com:8443', origins), {});
   eq(corsHeaders('chrome-extension://anything', origins)['Access-Control-Allow-Origin'], 'chrome-extension://anything');
+});
+
+// cr:rename-the-sourcery-client-to-mintuition (task #10). Do not edit this test.
+test('rename: the licence client is mintuition; only the live sourcery-gateway Worker keeps the old name', async () => {
+  eq(LICENSE_CLIENT.id, 'mintuition');
+  const fs = await import('node:fs');
+  const files = ['src/clients.js', 'src/routes.js', 'src/worker.js', 'src/session.js', 'src/polar.js', 'src/kv.js',
+    'wrangler.toml', 'INTEGRATION.md'];
+  for (const file of files) {
+    const path = new URL(`../${file}`, import.meta.url);
+    if (!fs.existsSync(path)) continue;
+    const leftovers = fs.readFileSync(path, 'utf8').split('\n')
+      .map((line, index) => [index + 1, line.replace(/sourcery-gateway/gi, '')])
+      .filter(([, line]) => /sourcery/i.test(line));
+    eq(leftovers, [], `${file} still names Sourcery (other than the live sourcery-gateway Worker)`);
+  }
 });
 
 test('policy table: public rows must be budget-free, read-only, exact-origin', async () => {
