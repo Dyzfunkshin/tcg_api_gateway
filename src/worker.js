@@ -206,6 +206,16 @@ async function licenseAttemptBlocked(ip, logTag, env, deps) {
   deps.log('license_attempts_limited', { ip, key: logTag });
   return errorResponse(429, 'license_attempts_exceeded', {}, { 'Retry-After': '60' });
 }
+
+// Global cap on calls to Polar (RATE_LIMIT_POLAR, one shared key): Polar allows about 3 licence
+// requests a second for the whole organisation, so random keys spread over many IPs could
+// otherwise use it all and leave every uncached real user with a 503. false = do not call Polar
+// (logged); binding absent or erroring = allowed.
+async function polarCallAllowed(op, logTag, env, deps) {
+  if ((await bindingAllows(env, 'RATE_LIMIT_POLAR', 'polar', deps)) !== false) return true;
+  deps.log('license_polar_limited', { op, key: logTag });
+  return false;
+}
 // Second layer (2026-11-07): the colo's edge cache (Cache API), which has no daily write limit,
 // so a fresh isolate in the same colo finds the verdict without a Polar call even while KV
 // refuses writes. Keyed by a synthetic URL; absent in node (tests) and on error.
@@ -230,7 +240,8 @@ async function forgetVerdict(env, cacheKey) {
   verdictMemory.delete(cacheKey);
   const cache = edgeCache();
   if (cache) { try { await cache.delete(VERDICT_CACHE_URL + cacheKey); } catch (error) { /* best effort */ } }
-  await deleteKey(env.LICENSES, cacheKey);
+  // A KV delete counts against the 1,000 writes a day; reads do not, so only delete what exists.
+  if ((await getJson(env.LICENSES, cacheKey)) !== null) await deleteKey(env.LICENSES, cacheKey);
 }
 
 // Resolves { verdict, ... } for a valid licence or { response } to return.
@@ -261,10 +272,14 @@ async function authenticateLicense(key, instanceId, ip, env, deps) {
 
   if (!verdict) {
     let result = null;
-    try {
-      result = await polar.validate(key, instanceId, env, deps.fetch);
-    } catch (error) {
-      deps.log('license_validate_failed', { key: logTag, error: String(error && error.message) });
+    if (!(await polarCallAllowed('validate', logTag, env, deps))) {
+      result = { status: 429, body: null }; // treated as a Polar outage: grace for a cached key, else 503
+    } else {
+      try {
+        result = await polar.validate(key, instanceId, env, deps.fetch);
+      } catch (error) {
+        deps.log('license_validate_failed', { key: logTag, error: String(error && error.message) });
+      }
     }
     if (!result || isUnavailable(result) || ![200, 400, 404, 422].includes(result.status)) {
       if (cached && cached.valid && now - cached.checkedAt < graceSeconds * 1000) {
@@ -281,8 +296,16 @@ async function authenticateLicense(key, instanceId, ip, env, deps) {
       const detail = String(result.body.detail ?? '');
       deps.log('license_not_found', { key: logTag, detail });
       verdict = invalidVerdict(inactiveWordIn(detail), now);
-      // Not-found verdicts stay in isolate memory only: a random key must never cost a KV write.
-      memoryRememberVerdict(cacheKey, verdict);
+      if (cached && cached.valid) {
+        // Revoked since a valid verdict was cached. Overwrite the shared copies (edge cache and
+        // KV) with the refusal, kept for the grace window, so no isolate's grace path revives
+        // the key while Polar is unreachable. Only keys that once validated reach this write.
+        deps.log('license_revoked_cached', { key: logTag });
+        await rememberVerdict(env, cacheKey, verdict, graceSeconds, deps);
+      } else {
+        // Not-found verdicts stay in isolate memory only: a random key must never cost a KV write.
+        memoryRememberVerdict(cacheKey, verdict);
+      }
     } else {
       // 400 / 422: Polar rejected the request itself. Not an outage and not worth caching.
       deps.log('license_rejected', { key: logTag, reason: 'Polar answered ' + result.status });
@@ -400,7 +423,8 @@ async function applyQuota(subject, limits, env, deps, context = {}) {
 
 // A license verdict is cached to spare Polar, not to decide anything: a failed write is logged
 // and the request carries on with the verdict it already has.
-async function rememberVerdict(env, cacheKey, verdict, ttlSeconds, deps) {
+// `toKv: false` keeps it to memory and the edge cache (no daily write limit).
+async function rememberVerdict(env, cacheKey, verdict, ttlSeconds, deps, { toKv = true } = {}) {
   memoryRememberVerdict(cacheKey, verdict);
   const cache = edgeCache();
   if (cache) {
@@ -410,6 +434,7 @@ async function rememberVerdict(env, cacheKey, verdict, ttlSeconds, deps) {
       deps.log('license_edge_cache_unavailable', { error: String(error && error.message) });
     }
   }
+  if (!toKv) return;
   try {
     await putJson(env.LICENSES, cacheKey, verdict, ttlSeconds);
   } catch (error) {
@@ -523,6 +548,7 @@ async function activateRoute(request, env, deps) {
   }
   const blocked = await licenseAttemptBlocked(callerIp(request), logTag, env, deps);
   if (blocked) return blocked;
+  if (!(await polarCallAllowed('activate', logTag, env, deps))) return unavailableResponse(null);
   let result = null;
   try {
     result = await polar.activate(licenseKey, instanceName, env, deps.fetch);
@@ -550,9 +576,12 @@ async function activateRoute(request, env, deps) {
     deps.log('license_activate_rejected', { key: logTag, reason: rejection.reason });
     return rejection.response;
   }
-  // Seed the verdict so the first authed request does not need another validate call.
+  // Seed the verdict so the first authed request does not need another validate call. Memory
+  // and the colo's edge cache only, never KV: every activate makes a new activation id, so a
+  // valid key cycling activate/deactivate would otherwise spend a KV write each round
+  // (2026-11-09 review). The first validate from another colo writes KV as usual.
   const cacheKey = 'lic:' + (await sha256Hex(`${licenseKey}|${activationId}`));
-  await rememberVerdict(env, cacheKey, verdict, toInt(env.LICENSE_GRACE_SECONDS, 86400), deps);
+  await rememberVerdict(env, cacheKey, verdict, toInt(env.LICENSE_GRACE_SECONDS, 86400), deps, { toKv: false });
   return jsonResponse(200, {
     instanceId: activationId,
     status: verdict.status,
@@ -564,6 +593,7 @@ async function activateRoute(request, env, deps) {
 }
 
 async function deactivateRoute(auth, env, deps) {
+  if (!(await polarCallAllowed('deactivate', auth.keyHash.slice(0, 8), env, deps))) return unavailableResponse(null);
   let result = null;
   try {
     result = await polar.deactivate(auth.key, auth.instanceId, env, deps.fetch);

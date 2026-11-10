@@ -55,6 +55,14 @@ name = "RATE_LIMIT_LICENSE_ATTEMPTS"
 namespace_id = "1005"
 simple = { limit = 20, period = 60 }
 
+# Global Polar budget: one key ("polar") for every caller, in front of every Polar call.
+# Polar allows ~3 licence requests/s; when this trips, cached keys ride their grace window
+# and uncached keys get 503 license_service_unavailable. Named by no client policy.
+[[ratelimits]]
+name = "RATE_LIMIT_POLAR"
+namespace_id = "1006"
+simple = { limit = 120, period = 60 }
+
 [[ratelimits]]
 name = "RATE_LIMIT_PUBLIC"    # anonymous callers, keyed by IP (IPv6 /64)
 namespace_id = "1002"

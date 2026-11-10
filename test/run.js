@@ -487,6 +487,61 @@ test('licence flood guard: deactivate is guarded (allow and deny)', async () => 
   eq(w.polarCalls('deactivate').length, 1);
 });
 
+// Global Polar budget: RATE_LIMIT_POLAR, one key for every caller, in front of each Polar call.
+test('polar budget: within it Polar is called (allow, keyed "polar"); a fresh cached verdict never spends it', async () => {
+  const limiter = fakeRateLimiter(1);
+  const w = createWorld({ RATE_LIMIT_POLAR: limiter });
+  eq((await w.send('/v1/license')).status, 200);
+  eq((await w.send('/v1/license')).status, 200);
+  eq([w.polarCalls('validate').length, limiter.keys], [1, ['polar']]);
+});
+
+test('polar budget: exhausted, an uncached key is 503 with Retry-After and logged (deny); a cached key rides its grace (allow)', async () => {
+  const limiter = fakeRateLimiter(1);
+  const w = createWorld({ RATE_LIMIT_POLAR: limiter });
+  eq((await w.send('/v1/license')).status, 200, 'spends the one call');
+  let res = await w.send('/v1/license', { key: 'random-flood-key-1' });
+  eq([res.status, res.headers.get('retry-after'), await readJson(res)], [503, '30', { error: 'license_service_unavailable' }]);
+  eq(w.polarCalls('validate').length, 1, 'no Polar call once the budget is spent');
+  const entry = eventsNamed(w, 'license_polar_limited')[0];
+  eq([entry.op, entry.key.length], ['validate', 8]);
+  ok(!JSON.stringify(w.logs).includes('random-flood-key-1'));
+  w.clock.t += 601 * 1000; // past the cache window, inside the grace window
+  res = await w.send('/v1/license');
+  eq(res.status, 200, 'the cached valid verdict is reused');
+  ok(eventsNamed(w, 'license_grace_reuse').length === 1);
+  res = await w.send('/v1/license/activate', { method: 'POST', key: null, instance: null, body: { licenseKey: KEY, instanceName: 'x' } });
+  eq([res.status, res.headers.get('retry-after')], [503, '30'], 'activate is refused too');
+  res = await w.send('/v1/license/deactivate', { method: 'POST' });
+  eq(res.status, 503, 'deactivate is refused too');
+  eq(w.polarCalls('activate').length + w.polarCalls('deactivate').length, 0);
+  eq(eventsNamed(w, 'license_polar_limited').map((e) => e.op), ['validate', 'validate', 'activate', 'validate', 'deactivate'], 'each grace reuse also logs the skipped validate');
+});
+
+test('revocation: a Polar 404 for a key with a cached valid verdict replaces the shared copy, so no isolate\'s grace path revives it (deny)', async () => {
+  const w = createWorld();
+  const ops = countKvOps(w);
+  eq((await w.send('/v1/license')).status, 200);
+  eq(ops.puts, 1);
+  w.clock.t += 601 * 1000;
+  w.responders.validate = () => jsonResponse(notFound('License key not found'), 404);
+  eq((await w.send('/v1/license')).status, 401);
+  eq(ops.puts, 2, 'one bounded write records the refusal');
+  ok(eventsNamed(w, 'license_revoked_cached').length === 1);
+  const stored = JSON.parse([...w.kv.store.entries()].find(([k]) => k.startsWith('lic:'))[1].value);
+  eq(stored.valid, false);
+  resetQuotaMemory(); // another isolate, with Polar down
+  w.clock.t += 601 * 1000;
+  w.responders.validate = () => jsonResponse({}, 500);
+  const res = await w.send('/v1/license');
+  eq(res.status, 503, 'the grace path refuses the revoked key');
+  eq(eventsNamed(w, 'license_grace_reuse').length, 0);
+  w.clock.t += 601 * 1000;
+  w.responders.validate = () => jsonResponse(notFound('License key not found'), 404);
+  eq((await w.send('/v1/license')).status, 401);
+  eq(ops.puts, 2, 'a key already recorded as refused costs no further write');
+});
+
 test('benefit filter: listed benefit allowed, unlisted rejected', async () => {
   let w = createWorld({ POLAR_BENEFIT_IDS: 'benefit-100, ' + BENEFIT_ID });
   eq((await w.send('/v1/license')).status, 200);
@@ -876,8 +931,11 @@ test('CORS: preflight is 204 without auth or upstream calls', async () => {
   eq(w.calls.length, 0);
 });
 
-test('activate: success returns instance details and seeds the verdict cache', async () => {
+test('activate: success returns instance details and seeds the verdict cache (memory and edge, never KV)', async () => {
   const w = createWorld();
+  const edge = createFakeCache(w.clock);
+  globalThis.caches = { default: edge };
+  try {
   w.responders.activate = () => jsonResponse(activateBody({ limit: 3, expiresAt: '2027-01-01T00:00:00.000000Z' }));
   const res = await w.send('/v1/license/activate', { method: 'POST', key: null, instance: null, body: { licenseKey: KEY, instanceName: 'laptop' } });
   eq(res.status, 200);
@@ -894,12 +952,37 @@ test('activate: success returns instance details and seeds the verdict cache', a
   eq(call.headers.accept, 'application/json');
   ok(call.headers['content-type'].startsWith('application/json'));
   eq(JSON.parse(call.body), { key: KEY, organization_id: ORG_ID, label: 'laptop' });
-  const seeded = [...w.kv.store.keys()].filter((k) => k.startsWith('lic:'));
+  eq([...w.kv.store.keys()].filter((k) => k.startsWith('lic:')).length, 0, 'activate spends no KV write');
+  const seeded = [...edge.store.keys()].filter((k) => k.includes('lic:'));
   eq(seeded.length, 1);
   ok(!seeded[0].includes(KEY), 'cache key never contains the license key');
-  eq(w.kv.ttls.get(seeded[0]), 86400);
+  eq(edge.store.get(seeded[0]).expiresAt, w.clock.t + 86400 * 1000);
   eq((await w.send('/v1/license')).status, 200);
   eq(w.polarCalls('validate').length, 0, 'first authed request uses the seeded verdict');
+  resetQuotaMemory(); // a fresh isolate in the same colo finds it in the edge cache
+  eq((await w.send('/v1/license')).status, 200);
+  eq(w.polarCalls('validate').length, 0, 'a fresh isolate uses the edge copy');
+  } finally {
+    delete globalThis.caches;
+  }
+});
+
+test('activate/deactivate cycling by a valid key spends no KV writes (deny), while a validate still persists to KV (allow)', async () => {
+  const w = createWorld();
+  const ops = countKvOps(w);
+  let deletes = 0;
+  const del = w.kv.delete;
+  w.kv.delete = async (...args) => { deletes += 1; return del(...args); };
+  for (let i = 0; i < 5; i += 1) {
+    eq((await w.send('/v1/license/activate', { method: 'POST', key: null, instance: null, body: { licenseKey: KEY, instanceName: 'laptop' } })).status, 200);
+    eq((await w.send('/v1/license/deactivate', { method: 'POST' })).status, 200);
+  }
+  eq([ops.puts, deletes], [0, 0], 'no KV write or delete across five cycles');
+  resetQuotaMemory();
+  eq((await w.send('/v1/license')).status, 200);
+  eq(ops.puts, 1, 'an uncached validate writes its verdict to KV');
+  eq((await w.send('/v1/license/deactivate', { method: 'POST' })).status, 200);
+  eq(deletes, 1, 'deactivate deletes the KV copy only when one exists');
 });
 
 test('activate: 403 limit is 409, revoked 402, other 403 and 404 are 401, bad body 400, outage 503', async () => {
@@ -1042,8 +1125,8 @@ test('activate: response carries tier (string or null)', async () => {
   let res = await post(w);
   eq(res.status, 200);
   eq((await readJson(res)).tier, 'pro');
-  const cacheKey = [...w.kv.store.keys()].find((k) => k.startsWith('lic:'));
-  eq(JSON.parse(w.kv.store.get(cacheKey).value).tier, 'pro', 'the seeded verdict carries the tier');
+  eq((await readJson(await w.send('/v1/license'))).tier, 'pro', 'the seeded verdict carries the tier');
+  eq(w.polarCalls('validate').length, 0);
   w = createWorld();
   res = await post(w);
   eq((await readJson(res)).tier, null);
@@ -1496,6 +1579,7 @@ function createFakeCache(clock) {
       }
       return new Response(entry.body.slice(0), { status: 200, headers: entry.headers });
     },
+    async delete(url) { return store.delete(String(url)); },
     async put(url, response) {
       const maxAge = Number(/max-age=(\d+)/.exec(response.headers.get('cache-control') || '')?.[1] ?? 0);
       store.set(String(url), { body: await response.arrayBuffer(), headers: Object.fromEntries(response.headers), expiresAt: clock.t + maxAge * 1000 });
