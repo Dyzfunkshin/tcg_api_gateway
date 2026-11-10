@@ -295,8 +295,8 @@ the Worker):
 
 | Credential | Bitwarden | Exists? |
 |---|---|---|
-| Cloudflare API token | `sourcery_cloudflare_api_token`, id `fae6f4f6-ca7b-401d-a71d-090af6411149` (`owner-ops`) | **Yes, but permissions are incomplete.** It has *Cloudflare Tunnel: Edit* (added 2026-11-08). It also needs *Workers Scripts: Edit*, *Workers KV Storage: Edit*, *Workers Routes: Edit* (zone `dyzzyscards.com`), *Access: Apps and Policies: Edit*, *Access: Service Tokens: Edit*, and *Turnstile: Edit*. Check what it already has before adding, under dash → Manage Account → Account API Tokens. Alternatively create a dedicated `tcg_gateway_cloudflare_api_token` and keep the Sourcery one tunnel-only. |
-| Bitwarden machine token (PC) | n/a (`owner-ops`, Credential Manager, above) | **Yes.** `owner-ops` is already **Can read, write** on every project, so creating the `api-gateway` secrets needs no temporary permission change. |
+| Cloudflare API token | `TCG_GATEWAY_CLOUDFLARE_API_TOKEN` (`api-gateway`); dashboard name `tcg-api-gateway` | **Yes.** Dedicated token, client-IP filtered to the owner's PC (2026-11-09). `tools/check_cloudflare_token.py` passed all 10 read-only checks on 2026-11-09 (Workers Scripts, KV `LICENSES`, Access apps + service tokens, Turnstile, zone `dyzzyscards.com`, Workers Routes, DNS). If the owner's IP changes, update the token's IP filter. The old `sourcery_cloudflare_api_token` stays tunnel-only and is not used by the gateway tools. |
+| Bitwarden machine token (PC) | n/a (`owner-ops`, Credential Manager, above) | **Yes** (stored 2026-11-09). `owner-ops` is **Can read, write** on every project, so creating the `api-gateway` secrets needs no temporary permission change. |
 
 Unchanged and not the gateway's concern: `JUSTTCG_API_KEY`
 (`139c13f6-…`, project `pricing-runtime`), used only by pricing;

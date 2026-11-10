@@ -2,7 +2,7 @@
 
 Usage (from a venv with bitwarden-sdk):  python tools/check_cloudflare_token.py
 
-Reads sourcery_cloudflare_api_token from Bitwarden (owner-ops) and makes only
+Reads TCG_GATEWAY_CLOUDFLARE_API_TOKEN from Bitwarden (owner-ops) and makes only
 GET requests, one per permission the plan needs (PLAN.md section 7). Prints each
 check's name and HTTP status, never the token. Exit code 0 only if all pass.
 """
@@ -26,6 +26,8 @@ def main() -> int:
         passed = status == 200 and body.get("success") is True
         if passed and extra:
             passed, detail = extra(body)
+            if passed and not detail.startswith("status "):
+                detail = ""  # a failure message only means something when the check fails
         if not passed and not detail:
             errors = body.get("errors") or []
             detail = "; ".join(str(e.get("message", "")) for e in errors)[:160]
