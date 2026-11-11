@@ -365,10 +365,10 @@ All alerts email the owner (the account's existing notification email).
 
 | Alert | How | State |
 |---|---|---|
-| Worker errors and 5xx (incl. `502 origin_unavailable`: pricing/catalog down or the Access lock misconfigured) | Workers Observability **Issues** (`[observability.issues]` in `wrangler.toml`) + notification policy "tcg-api-gateway: Worker issues" (`workers_observability_real_time_issue`) | Policy created via API; Issues takes effect on the next deploy |
-| `license_service_unavailable` > 20 / 15 min | Workers Observability **Monitor** (dashboard only; no documented API) delivered by policy "tcg-api-gateway: Workers Observability alerts" (`workers_observability_alert`, firing + resolved) | Policy created; monitor is an owner dashboard step |
-| `credential_invalid` + `license_invalid` > 200 / 15 min (key guessing) | Monitor, same policy | owner dashboard step |
-| `rate_limited` > 500 / 15 min (abuse or a looping client) | Monitor, same policy | owner dashboard step |
+| Worker errors and 5xx (incl. `502 origin_unavailable`: pricing/catalog down or the Access lock misconfigured) | Workers Observability **Issues** (`[observability.issues]` in `wrangler.toml`) + notification policy "tcg-api-gateway: Worker issues" (`workers_observability_real_time_issue`) | **Live** (deployed script has `observability.issues.enabled`) |
+| `license_service_unavailable` > 20 / 15 min | **Not built.** Workers Observability Monitors are not offered on Workers Free (no Monitors in the dashboard). Backlog: a scheduled GitHub Actions check querying the telemetry API (needs a token with Workers Observability: Read), or Workers Paid. Policy "tcg-api-gateway: Workers Observability alerts" (`workers_observability_alert`) exists for Monitors if the account upgrades | backlog (task #13) |
+| `credential_invalid` + `license_invalid` > 200 / 15 min (key guessing) | same | backlog (task #13) |
+| `rate_limited` > 500 / 15 min (abuse or a looping client) | same | backlog (task #13) |
 | Access service token expiring or leaked | existing account policies "Expiring/Leaked Service Token Alert" | already on |
 | Spend | existing "Default budget alert" ($10) | already on |
 
