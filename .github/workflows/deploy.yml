@@ -43,7 +43,9 @@ jobs:
           grep -q '{ pattern = "api.dyzzyscards.com", custom_domain = true }' wrangler.toml
           grep -q '{ pattern = "api.mintuition.app", custom_domain = true }' wrangler.toml
 
-      # Secret id of TCG_GATEWAY_CLOUDFLARE_API_TOKEN (Bitwarden project api-gateway).
+      # Secret id of TCG_GATEWAY_CI_CLOUDFLARE_API_TOKEN (Bitwarden project api-gateway): a
+      # deploy-only Cloudflare token with no IP filter, since runner addresses vary. The
+      # operator token (TCG_GATEWAY_CLOUDFLARE_API_TOKEN) is IP-restricted and stays off CI.
       # The action masks the value in logs.
       - name: Read the Cloudflare token from Bitwarden
         uses: bitwarden/sm-action@1238aae8fc64b212641190a9227c8a734ab1a793 # v3.0.1
@@ -51,7 +53,7 @@ jobs:
           access_token: ${{ secrets.BW_ACCESS_TOKEN }}
           cloud_region: us
           secrets: |
-            9e6a28aa-933b-4493-b1e6-b4fd00ae893c > CLOUDFLARE_API_TOKEN
+            7a9f28a0-9384-4e5f-9ae2-b5000032fee6 > CLOUDFLARE_API_TOKEN
 
       # wrangler 4 only: wrangler 3 silently drops the [[ratelimits]] bindings (CLAUDE.md).
       - name: Deploy
