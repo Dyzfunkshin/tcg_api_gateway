@@ -593,3 +593,13 @@ sections above):
     only that account's access token, as the repository secret `BW_ACCESS_TOKEN`.
     `main` exists from this date and is GitHub's default branch. Deploying from the
     owner's PC as `gateway-deploy` remains the fallback.
+30. **First app key: `poke-guide-dev`** (owner, 2026-11-12; huddle `poke-guide-dev-key`).
+    poke-guide is dropping R2, and a build served on the owner's computer cannot use the
+    Turnstile session (the widget and the `poke-guide` client accept only the production
+    origins). The owner chose a development key over running a local gateway. The row
+    shares the live site's route list (`POKE_GUIDE_ROUTES`, so they cannot drift), has
+    fill policy `none`, origins `http://localhost:5500` and `http://127.0.0.1:5500`, and
+    600/min + 20,000/day. Section 6.4 called app keys "server-side"; this one is used by
+    a browser build that never leaves the owner's computer. The key is
+    `TCG_GATEWAY_APP_KEY_POKE_GUIDE_DEV`, created by `tools/create_app_key.py`; if it
+    leaks, delete the row (or rotate with `--rotate` and update the hash) and deploy.

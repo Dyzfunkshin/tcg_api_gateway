@@ -1956,6 +1956,67 @@ test('pass-through: GET bodies are streamed, never buffered', async () => {
   eq([res.headers.get('etag'), gatewayHeaderNames(res)], ['"big"', []]);
 });
 
+// Huddle poke-guide-dev-key (PLAN.md decision 30): a development key for poke-guide built on
+// the owner's computer. The real row is used with a test key's hash in place of the real one.
+const DEV_ORIGIN = 'http://localhost:5500';
+const devRow = () => DEFAULT_CLIENTS.appKeys.find((client) => client.id === 'poke-guide-dev');
+async function createDevKeyWorld(envOverrides = {}) {
+  const w = createWorld(envOverrides);
+  w.deps.clients = { ...DEFAULT_CLIENTS, appKeys: [Object.freeze({ ...devRow(), keySha256: await sha256Hex(APP_KEY) })] };
+  assertValidClients(w.deps.clients);
+  w.devSend = (path, options = {}) => w.send(path, { key: APP_KEY, instance: null, origin: DEV_ORIGIN, ...options });
+  return w;
+}
+
+test('poke-guide-dev: the row reads exactly what the live site reads, never fills, and holds only a hash', async () => {
+  const row = devRow();
+  const site = DEFAULT_CLIENTS.publicSessions.find((client) => client.id === 'poke-guide');
+  eq([...row.routes], [...site.routes], 'same route list as the poke-guide session client');
+  eq([row.auth, row.fillPolicy, row.maxQuoteItems], ['app-key', 'none', 100]);
+  eq([...row.origins], ['http://localhost:5500', 'http://127.0.0.1:5500']);
+  eq(row.quota, { daily: 20000, perMinute: 600, perMinuteBinding: 'RATE_LIMIT_APP' });
+  ok(/^[0-9a-f]{64}$/.test(row.keySha256));
+  ok(!row.routes.some((id) => id.startsWith('gateway:') || id.endsWith('.write') || id === 'catalog:products.lookup' || id === 'catalog:tags'));
+});
+
+test('poke-guide-dev: the key reads the site routes from the local origin, with fill policy none (allow)', async () => {
+  const w = await createDevKeyWorld();
+  for (const path of ['/catalog/v1/games', '/catalog/v1/sets?game=pokemon', VIEW_PATH, '/catalog/v1/manifest.json', '/pricing/v1/prices/snapshot/manifest.json', SNAPSHOT_FILE_PATH, '/pricing/v1/prices/product/42']) {
+    const res = await w.devSend(path);
+    eq(res.status, 200, path);
+    eq(res.headers.get('access-control-allow-origin'), DEV_ORIGIN, path);
+  }
+  const loopback = await w.devSend('/catalog/v1/games', { origin: 'http://127.0.0.1:5500' });
+  eq([loopback.status, loopback.headers.get('access-control-allow-origin')], [200, 'http://127.0.0.1:5500']);
+  await w.devSend('/pricing/v1/prices/quote', { method: 'POST', body: [{ productId: 1 }], headers: { 'x-fill-policy': 'default' } });
+  eq(lastUpstream(w, PRICING).headers['x-fill-policy'], 'none', 'a development build can never spend JustTCG budget');
+  const preflight = await w.send('/catalog/v1/games', { method: 'OPTIONS', key: null, instance: null, origin: DEV_ORIGIN });
+  eq([preflight.status, preflight.headers.get('access-control-allow-origin')], [204, DEV_ORIGIN]);
+  ok(preflight.headers.get('access-control-allow-headers').includes('authorization'));
+});
+
+test('poke-guide-dev: nothing beyond the site routes, no other local port, no other key (deny)', async () => {
+  const w = await createDevKeyWorld();
+  const upstreamCount = () => w.calls.filter((c) => c.url.startsWith(PRICING) || c.url.startsWith(CATALOG)).length;
+  eq((await w.devSend('/catalog/v1/products:lookup', { method: 'POST', body: {} })).status, 403);
+  eq((await w.devSend('/catalog/v1/tags')).status, 403);
+  eq((await w.devSend('/catalog/v1/tags/mew%7C25', { method: 'POST', body: {} })).status, 403);
+  eq((await w.devSend('/v1/license')).status, 403);
+  eq((await w.devSend('/pricing/v1/prices/snapshot/pokemon.json')).status, 404);
+  const tooMany = await w.devSend('/pricing/v1/prices/quote', { method: 'POST', body: Array.from({ length: 101 }, () => ({ productId: 1 })) });
+  eq(tooMany.status, 413, 'the quote batch cap applies');
+  eq((await w.send('/catalog/v1/games', { key: 'c'.repeat(64), instance: null, origin: DEV_ORIGIN })).status, 401, 'a different key is not the dev key');
+  eq(upstreamCount(), 0, 'no refused request reached a service');
+  for (const origin of ['http://localhost:3000', 'https://localhost:5500', 'http://localhost:5500.evil.example']) {
+    const res = await w.devSend('/catalog/v1/games', { origin });
+    eq(res.headers.get('access-control-allow-origin'), null, 'no CORS grant for ' + origin);
+  }
+  const limited = await createDevKeyWorld({ RATE_LIMIT_APP: fakeRateLimiter(0) });
+  const res = await limited.devSend('/catalog/v1/games');
+  eq(res.status, 429);
+  ok(res.headers.get('retry-after'));
+});
+
 // Change request forward-price-snapshot-routes (pricing INTEGRATION.md section 8) and catalog's
 // filtered views + sets (#186, #188): bulk reads for poke-guide, passed through untouched.
 const SNAPSHOT_FILE_PATH = '/pricing/v1/prices/snapshot/pokemon-0123456789abcdef.json';

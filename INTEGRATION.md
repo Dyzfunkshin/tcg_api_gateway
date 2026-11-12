@@ -69,8 +69,19 @@ as a licence when `X-Instance-Id` is present. **A credential that is present but
 invalid is always refused with 401**; it never falls back to anonymous access.
 
 To get an app key, add a policy row to `src/clients.js` (routes, fill policy,
-quota) and store the key in Bitwarden (project `api-gateway`,
-`TCG_GATEWAY_APP_KEY_<APP>`); see [docs/PLAN.md](docs/PLAN.md) section 6.4.
+quota) and create the key with `python tools/create_app_key.py <APP> --apply`, which
+stores it in Bitwarden (project `api-gateway`, `TCG_GATEWAY_APP_KEY_<APP>`) and prints
+the SHA-256 for the row; see [docs/PLAN.md](docs/PLAN.md) section 6.4.
+
+**App keys in use**
+
+| Client | For | May call | Limits |
+|---|---|---|---|
+| `poke-guide-dev` | poke-guide built and served on the owner's computer (`http://localhost:5500`, `http://127.0.0.1:5500`) | exactly the public-site routes listed under "Public websites" below; fill policy `none` | 600 requests/min, 20,000/day, 100 items per quote |
+
+The development key is read from Bitwarden (`TCG_GATEWAY_APP_KEY_POKE_GUIDE_DEV`) for
+local builds only. It must never be committed, passed to CI, or included in a published
+build. The two local origins get CORS headers; the key itself is what grants access.
 
 ## Public browser sessions (poke-guide)
 
