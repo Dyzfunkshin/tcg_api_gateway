@@ -35,9 +35,12 @@ Request and response bodies are the services' own: **each service's
 | `GET /pricing/v1/prices/product/<digits>` | per-product prices |
 | `GET /pricing/v1/history`, `/history/printings`, `/history/coverage` | price history |
 | `GET /pricing/v1/games` | games pricing covers |
+| `GET /pricing/v1/prices/snapshot/manifest.json`, `GET /pricing/v1/prices/snapshot/<game>-<16 hex>.json` | per-game bulk price snapshots (pricing `INTEGRATION.md` section 8) |
 | `GET /catalog/v1/health` | catalog health |
 | `GET /catalog/v1/manifest.json` | artifact manifest |
 | `GET /catalog/v1/artifacts/<file>` | content-hashed artifact |
+| `GET /catalog/v1/views/catalog-<16 hex>.json?game=&kind=&fields=` | filtered slice of a catalog artifact |
+| `GET /catalog/v1/sets?game=` | sets and release dates |
 | `GET /catalog/v1/images/<file>` | scan-tier image |
 | `GET /catalog/v1/products/<digits>`, `POST /catalog/v1/products:lookup` | product facts |
 | `GET /catalog/v1/games` | catalog game lines |
@@ -111,8 +114,12 @@ else is `403 forbidden`):
 - `GET /pricing/v1/prices/product/<digits>`
 - `GET /pricing/v1/history`, `/history/printings`, `/history/coverage`
 - `GET /pricing/v1/games`
+- `GET /pricing/v1/prices/snapshot/manifest.json`
+- `GET /pricing/v1/prices/snapshot/<game>-<16 hex>.json`
 - `GET /catalog/v1/manifest.json`
 - `GET /catalog/v1/artifacts/<file>`
+- `GET /catalog/v1/views/catalog-<16 hex>.json` (query passed through)
+- `GET /catalog/v1/sets`
 - `GET /catalog/v1/images/<file>`
 - `GET /catalog/v1/products/<digits>`
 - `GET /catalog/v1/games`
@@ -156,14 +163,16 @@ clients that send `Accept-Encoding`, so the browser receives
 verified by a live probe (`curl -H 'Accept-Encoding: br' -I` on a large artifact)
 once the gateway is live, not by the offline tests.
 
-### Pending routes (not yet available)
+### Bulk snapshot and view routes
 
-**Not allow-listed: both return `404 not_found` today.** The gateway allows a path only
-after the owning service's own `INTEGRATION.md` defines it. What these routes return is
-`tcg_pricing_service`'s contract, not the gateway's.
-
-- `GET /pricing/v1/prices/snapshot/manifest.json`
-- `GET /pricing/v1/prices/snapshot/<file>`
+The price snapshot routes and the catalog view and sets routes are allowed for the
+`poke-guide` public-session client only. File names must match the shapes above exactly;
+any other path under `/pricing/v1/prices/snapshot/` or `/catalog/v1/views/` is
+`404 not_found` and never reaches the service. What the routes return is the owning
+service's contract. The gateway passes the status, body, `content-type`, `ETag` and
+`Cache-Control` through and caches nothing, so a browser's own cache (the services mark
+content-addressed files `immutable`) is the only cache. Request headers other than
+`content-type` and `accept` are dropped, so `If-None-Match` does not reach the service.
 
 ## What the gateway adds and removes
 

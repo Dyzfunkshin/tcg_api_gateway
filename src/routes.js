@@ -15,6 +15,11 @@ const DIGITS = '\\d{1,12}';
 // "/", "\", "." or a control character, so it can never become a path or a traversal.
 const TAG_KEY = '(?!\\.)(?:[A-Za-z0-9._-]|%(?!2[EeFf]|5[Cc]|[01][0-9A-Fa-f]|7[Ff])[0-9A-Fa-f]{2}){1,200}';
 
+// Content-addressed file names: "<game>-<16 hex>.json" (pricing snapshots) and
+// "catalog-<16 hex>.json" (catalog views). Anything else under those prefixes is unknown.
+const SNAPSHOT_FILE = '[a-z0-9]+-[0-9a-f]{16}\\.json';
+const CATALOG_VIEW_FILE = 'catalog-[0-9a-f]{16}\\.json';
+
 const route = (id, method, service, pattern) => Object.freeze({ id, method, service, pattern: new RegExp('^' + pattern + '$') });
 
 // The gateway's own routes, matched on the full request path.
@@ -35,9 +40,13 @@ export const SERVICE_ROUTES = Object.freeze([
   route('pricing:history.printings', 'GET', 'pricing', '/v1/history/printings'),
   route('pricing:history.coverage', 'GET', 'pricing', '/v1/history/coverage'),
   route('pricing:games', 'GET', 'pricing', '/v1/games'),
+  route('pricing:snapshot.manifest', 'GET', 'pricing', '/v1/prices/snapshot/manifest\\.json'),
+  route('pricing:snapshot.file', 'GET', 'pricing', `/v1/prices/snapshot/${SNAPSHOT_FILE}`),
   route('catalog:health', 'GET', 'catalog', '/v1/health'),
   route('catalog:manifest', 'GET', 'catalog', '/v1/manifest\\.json'),
   route('catalog:artifact', 'GET', 'catalog', `/v1/artifacts/${FILE}`),
+  route('catalog:view', 'GET', 'catalog', `/v1/views/${CATALOG_VIEW_FILE}`),
+  route('catalog:sets', 'GET', 'catalog', '/v1/sets'),
   route('catalog:image', 'GET', 'catalog', `/v1/images/${FILE}`),
   route('catalog:products.get', 'GET', 'catalog', `/v1/products/${DIGITS}`),
   route('catalog:products.lookup', 'POST', 'catalog', '/v1/products:lookup'),

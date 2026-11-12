@@ -1956,6 +1956,76 @@ test('pass-through: GET bodies are streamed, never buffered', async () => {
   eq([res.headers.get('etag'), gatewayHeaderNames(res)], ['"big"', []]);
 });
 
+// Change request forward-price-snapshot-routes (pricing INTEGRATION.md section 8) and catalog's
+// filtered views + sets (#186, #188): bulk reads for poke-guide, passed through untouched.
+const SNAPSHOT_FILE_PATH = '/pricing/v1/prices/snapshot/pokemon-0123456789abcdef.json';
+const VIEW_PATH = '/catalog/v1/views/catalog-0123456789abcdef.json';
+
+test('routes: snapshot and view paths match only their exact file shapes', async () => {
+  eq(matchPath('/pricing/v1/prices/snapshot/manifest.json').routes[0].id, 'pricing:snapshot.manifest');
+  eq(matchPath(SNAPSHOT_FILE_PATH).routes[0].id, 'pricing:snapshot.file');
+  eq(matchPath(SNAPSHOT_FILE_PATH).upstreamPath, '/v1/prices/snapshot/pokemon-0123456789abcdef.json');
+  eq(matchPath(VIEW_PATH).routes[0].id, 'catalog:view');
+  eq(matchPath('/catalog/v1/sets').routes[0].id, 'catalog:sets');
+  for (const file of ['manifestxjson', 'pokemon.json', 'pokemon-0123456789abcde.json', 'pokemon-0123456789abcdef0.json', 'pokemon-0123456789ABCDEF.json', 'Pokemon-0123456789abcdef.json', 'pokemon-0123456789abcdefxjson', 'a/pokemon-0123456789abcdef.json', '..', '']) {
+    eq(matchPath('/pricing/v1/prices/snapshot/' + file), null, 'snapshot ' + file);
+  }
+  for (const file of ['pokemon-0123456789abcdef.json', 'catalog-0123456789abcde.json', 'catalog-0123456789abcdefxjson', 'catalog.json', 'a/catalog-0123456789abcdef.json', '']) {
+    eq(matchPath('/catalog/v1/views/' + file), null, 'view ' + file);
+  }
+  eq(matchPath('/catalog/v1/prices/snapshot/manifest.json'), null, 'snapshots are pricing routes only');
+  eq(matchPath('/pricing/v1/sets'), null, 'sets is a catalog route only');
+});
+
+test('snapshots and views: a poke-guide session reads all four routes, passed through untouched (allow)', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue();
+  const headers = { 'content-type': 'application/json; charset=utf-8', etag: 'W/"abc"', 'cache-control': 'public, max-age=31536000, immutable', vary: 'Accept-Encoding' };
+  const body = '{"big":"' + 'y'.repeat(3000) + '"}';
+  w.responders.pricing = () => new Response(body, { status: 200, headers });
+  w.responders.catalog = () => new Response(body, { status: 200, headers });
+  const cases = [
+    ['/pricing/v1/prices/snapshot/manifest.json', PRICING, '/v1/prices/snapshot/manifest.json'],
+    [SNAPSHOT_FILE_PATH, PRICING, '/v1/prices/snapshot/pokemon-0123456789abcdef.json'],
+    [VIEW_PATH + '?game=pokemon&kind=single&fields=n,num,p', CATALOG, '/v1/views/catalog-0123456789abcdef.json?game=pokemon&kind=single&fields=n,num,p'],
+    ['/catalog/v1/sets?game=pokemon', CATALOG, '/v1/sets?game=pokemon'],
+  ];
+  for (const [path, origin, upstream] of cases) {
+    const res = await w.publicSend(path, token);
+    eq(res.status, 200, path);
+    eq(await res.text(), body, path);
+    eq([res.headers.get('content-type'), res.headers.get('etag'), res.headers.get('cache-control')], ['application/json; charset=utf-8', 'W/"abc"', 'public, max-age=31536000, immutable'], path);
+    eq(res.headers.get('vary'), 'Origin', 'the origin Vary is not copied: the edge negotiates encoding with the browser itself');
+    eq(gatewayHeaderNames(res), [], 'no gateway cache marker');
+    eq(w.originCalls(origin).at(-1).url, origin + upstream, 'path and query forwarded as sent');
+  }
+  // a repeat request reaches the origin again: the gateway holds no response cache
+  await w.publicSend(SNAPSHOT_FILE_PATH, token);
+  eq(w.originCalls(PRICING).length, 3);
+  // pricing's 404 for a retired file passes through as pricing sent it
+  w.responders.pricing = () => new Response('{"error":"not_found"}', { status: 404, headers: { 'content-type': 'application/json' } });
+  const retired = await w.publicSend(SNAPSHOT_FILE_PATH, token);
+  eq([retired.status, await retired.text(), retired.headers.get('cache-control')], [404, '{"error":"not_found"}', null]);
+});
+
+test('snapshots and views: refused without a poke-guide session, and for other clients (deny)', async () => {
+  const w = createPublicWorld();
+  const token = await w.issue();
+  const originCount = () => w.originCalls(PRICING).length + w.originCalls(CATALOG).length;
+  const paths = ['/pricing/v1/prices/snapshot/manifest.json', SNAPSHOT_FILE_PATH, VIEW_PATH, '/catalog/v1/sets'];
+  for (const path of paths) {
+    const before = originCount();
+    eq((await w.send(path, { key: null, instance: null })).status, 401, 'anonymous ' + path);
+    eq((await w.send(path, {})).status, 403, 'licence client ' + path);
+    eq((await w.publicSend(path, token, { method: 'POST', body: {} })).status, 405, 'POST ' + path);
+    eq(originCount(), before, 'nothing reached an origin: ' + path);
+  }
+  const before = originCount();
+  eq((await w.publicSend('/pricing/v1/prices/snapshot/pokemon.json', token)).status, 404, 'a snapshot path of neither shape');
+  eq((await w.publicSend('/catalog/v1/views/pokemon-0123456789abcdef.json', token)).status, 404, 'a view that is not a catalog file');
+  eq(originCount(), before);
+});
+
 test('pass-through: every public quote is forwarded as sent, the answer returned byte-for-byte (allow)', async () => {
   const w = createPublicWorld();
   const token = await w.issue();
