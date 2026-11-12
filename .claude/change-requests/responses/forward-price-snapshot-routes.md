@@ -23,11 +23,13 @@ The gateway commits to:
 - `GET /pricing/v1/prices/snapshot/<file>` forwards only when `<file>` matches
   `^[a-z0-9]+-[0-9a-f]{16}\.json$`. Any other path under `/pricing/v1/prices/snapshot/`
   gets the gateway's 404 (`not_found`) and never reaches pricing.
-- Both are allowed for the `poke-guide` public-session client (a Bearer session from
+- Both are allowed for the `poke-guide` public-session client (an `Authorization: Session <token>` from
   `POST /v1/session`, origins `https://poke-guide.com` and `https://dyzfunkshin.github.io`).
   A request without a session gets 401. No other client is granted them in this change.
-- Pass-through: the status, body and headers pricing returns reach the browser as sent,
-  including `Cache-Control`, `Vary`, `ETag` and pricing's 404 for a retired file. The body
+- Pass-through: the status and body pricing returns reach the browser as sent, with
+  pricing's `content-type`, `ETag` and `Cache-Control`, and pricing's 404 for a retired
+  file. Other response headers (including `Vary`) are not copied; Cloudflare's edge
+  negotiates compression with the browser itself. (Corrected after build, 2026-11-11.) The body
   is streamed, not buffered, so file size is not limited by the Worker's memory. The
   decoded bytes a browser receives are pricing's bytes, so the manifest's `sha256` and
   `bytes` hold.
