@@ -41,6 +41,11 @@ python tools/cutover.py [--preflight | --apply] # G3 cut-over + G4 Access lock; 
 (only a warning) and the Worker then runs with no per-minute limits. Check the
 binding list in `npx wrangler@4 deploy --dry-run` output before any real deploy.
 
+**Deploying:** push a version tag on a commit that is on `main` (`git tag v1.2.3 && git push
+origin v1.2.3`). `.github/workflows/deploy.yml` runs the tests, reads the Cloudflare token
+from Bitwarden (machine account `gateway-ci`, GitHub secret `BW_ACCESS_TOKEN`) and runs
+`wrangler@4 deploy`. Only the owner creates tags; a deploy from a PC is the fallback.
+
 ## Rules
 
 - **Zero runtime dependencies.** Worker code uses only platform APIs.
@@ -56,7 +61,7 @@ binding list in `npx wrangler@4 deploy --dry-run` output before any real deploy.
 - **Secrets never appear in code, logs, or output.** Bitwarden (project
   `api-gateway`) is the source of truth; see PLAN.md section 7. Licence keys are
   logged only as a hash prefix.
-- **No deploy, secret push, or Cloudflare API call** until the owner confirms
-  the Cloudflare token's Workers permissions (PLAN.md section 8, build gates).
-- **Git:** one branch per migration step (`feature/g0-bootstrap`, `feature/g1-…`),
-  committed at the end of the step; never merge to `main`.
+- **No deploy, version tag, secret push, or mutating Cloudflare API call** without the
+  owner's go-ahead for that action. A `v*` tag on `main` is a production deploy.
+- **Git:** one branch per piece of work, committed at the end of it; merge to `dev` or
+  `main` only when the owner asks.

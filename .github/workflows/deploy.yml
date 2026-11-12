@@ -1,0 +1,63 @@
+# Deploys tcg-api-gateway when a version tag (v*) is pushed, and only then.
+# The tagged commit must be on main and pass the offline tests. The Cloudflare API token
+# is read from Bitwarden at run time (docs/PLAN.md section 7); GitHub holds only the
+# gateway-ci machine-account token, as the repository secret BW_ACCESS_TOKEN.
+name: deploy
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CLOUDFLARE_ACCOUNT_ID: 722b682d1c0bb958ea4d14b5bc6275d1
+      WRANGLER_SEND_METRICS: 'false'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse a tag that is not on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Offline tests
+        run: npm test
+
+      - name: Refuse a wrangler.toml that drops a custom domain
+        run: |
+          grep -q '{ pattern = "api.dyzzyscards.com", custom_domain = true }' wrangler.toml
+          grep -q '{ pattern = "api.mintuition.app", custom_domain = true }' wrangler.toml
+
+      # Secret id of TCG_GATEWAY_CLOUDFLARE_API_TOKEN (Bitwarden project api-gateway).
+      # The action masks the value in logs.
+      - name: Read the Cloudflare token from Bitwarden
+        uses: bitwarden/sm-action@1238aae8fc64b212641190a9227c8a734ab1a793 # v3.0.1
+        with:
+          access_token: ${{ secrets.BW_ACCESS_TOKEN }}
+          cloud_region: us
+          secrets: |
+            9e6a28aa-933b-4493-b1e6-b4fd00ae893c > CLOUDFLARE_API_TOKEN
+
+      # wrangler 4 only: wrangler 3 silently drops the [[ratelimits]] bindings (CLAUDE.md).
+      - name: Deploy
+        run: npx --yes wrangler@4 deploy
+
+      - name: Both hostnames answer health
+        run: |
+          curl --fail --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors https://api.dyzzyscards.com/v1/health
+          curl --fail --silent --show-error --retry 5 --retry-delay 5 --retry-all-errors https://api.mintuition.app/v1/health

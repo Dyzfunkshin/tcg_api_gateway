@@ -582,3 +582,11 @@ sections above):
     when unattached for mintuition only); any other Worker or a zone route stops it
     before a mutation, and a failed step rolls back both hosts. All Polar tiers keep
     fill policy `default` (decision 27).
+29. **Deploy from GitHub on a version tag** (owner, 2026-11-11). Pushing a `v*` tag whose
+    commit is on `main` runs `.github/workflows/deploy.yml`: offline tests, a check that
+    `wrangler.toml` still lists both custom domains, `wrangler@4 deploy`, then a health
+    check on both hostnames. The Cloudflare token is read from Bitwarden at run time by
+    the machine account `gateway-ci` (**Can read** on `api-gateway` only); GitHub holds
+    only that account's access token, as the repository secret `BW_ACCESS_TOKEN`.
+    `main` exists from this date and is GitHub's default branch. Deploying from the
+    owner's PC as `gateway-deploy` remains the fallback.
