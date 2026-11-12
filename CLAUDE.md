@@ -33,6 +33,7 @@ Each prints its plan and contacts nothing unless given `--apply`:
 ```
 python tools/check_cloudflare_token.py          # read-only token permission check
 python tools/push_secrets.py [--only NAME] [--generate-session-key] [--apply]
+python tools/create_app_key.py <APP> [--rotate] [--apply]   # new app key -> Bitwarden; prints only its SHA-256
 python tools/cutover.py [--preflight | --apply] # G3 cut-over + G4 Access lock; stops for typed go-aheads
 ```
 

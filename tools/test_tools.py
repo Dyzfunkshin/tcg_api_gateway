@@ -17,6 +17,7 @@ import urllib.parse
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import cloudflare_api  # noqa: E402
+import create_app_key  # noqa: E402
 import cutover  # noqa: E402
 import push_secrets  # noqa: E402
 from cloudflare_api import ACCOUNT_ID, CloudflareClient, CloudflareError  # noqa: E402
@@ -450,6 +451,47 @@ class CutoverTests(unittest.TestCase):
         h = Harness()
         self.assertEqual(h.cutover(argv=["--preflight"]), 0, h.stderr)
         self.assertEqual(h.cf.mutations(), [])
+
+
+class CreateAppKeyTests(unittest.TestCase):
+    NAME = "TCG_GATEWAY_APP_KEY_POKE_GUIDE_DEV"
+
+    def run_tool(self, argv, store):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = create_app_key.main(argv, open_store=lambda: store)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_plan_mode_contacts_nothing(self):
+        store = FakeStore([], values={})
+        code, out, _ = self.run_tool(["POKE_GUIDE_DEV"], store)
+        self.assertEqual((code, store.events, store.values), (0, [], {}))
+        self.assertIn(self.NAME, out)
+
+    def test_apply_stores_the_key_and_prints_only_its_hash(self):
+        store = FakeStore([], values={})
+        code, out, err = self.run_tool(["POKE_GUIDE_DEV", "--apply"], store)
+        key = store.values[self.NAME]
+        self.assertEqual((code, store.events), (0, [("bitwarden.put", self.NAME)]))
+        self.assertRegex(key, r"^[0-9a-f]{64}$")
+        self.assertIn("keySha256 " + create_app_key.key_sha256(key), out)
+        self.assertNotIn(key, out + err)
+
+    def test_existing_key_is_kept_unless_rotate(self):
+        store = FakeStore([], values={self.NAME: "old-key-never-print-0008"})
+        code, out, err = self.run_tool(["POKE_GUIDE_DEV", "--apply"], store)
+        self.assertEqual((code, store.events, store.values[self.NAME]), (1, [], "old-key-never-print-0008"))
+        self.assertNotIn("old-key-never-print-0008", out + err)
+        code, _, _ = self.run_tool(["POKE_GUIDE_DEV", "--apply", "--rotate"], store)
+        self.assertEqual(code, 0)
+        self.assertNotEqual(store.values[self.NAME], "old-key-never-print-0008")
+
+    def test_bad_app_name_and_store_failure(self):
+        store = FakeStore([], values={})
+        self.assertEqual(self.run_tool(["poke guide"], store)[0], 2)
+        failing = FakeStore([], values={}, fail_put=True)
+        self.assertEqual(self.run_tool(["POKE_GUIDE_DEV", "--apply"], failing)[0], 1)
+        self.assertEqual(failing.values, {})
 
 
 class SecretSweepTests(unittest.TestCase):

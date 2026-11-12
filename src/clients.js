@@ -56,11 +56,46 @@ export const LICENSE_CLIENT = Object.freeze({
   origins: Object.freeze(['chrome-extension://', 'moz-extension://']),
 });
 
-// Server-side apps, one row per app, each with its own key (PLAN.md section 6.4).
+// What the poke-guide website may read: prices, history, product facts and the bulk
+// catalog and price files. Read-only. Shared by the live site's session client and the
+// development key below, so a local build can read exactly what the live site can.
+const POKE_GUIDE_ROUTES = Object.freeze([
+  'pricing:quote',
+  'pricing:product',
+  'pricing:history',
+  'pricing:history.printings',
+  'pricing:history.coverage',
+  'pricing:games',
+  'pricing:snapshot.manifest',
+  'pricing:snapshot.file',
+  'catalog:manifest',
+  'catalog:artifact',
+  'catalog:view',
+  'catalog:sets',
+  'catalog:image',
+  'catalog:products.get',
+  'catalog:games',
+]);
+
+// Apps with their own key, one row per app (PLAN.md section 6.4).
 // keySha256 = sha256 hex of the 32-byte key; the plaintext is only in Bitwarden
 // (TCG_GATEWAY_APP_KEY_<APP>, project api-gateway) and the app's own secret store.
-// Revoke by deleting the row and redeploying. None are onboarded yet.
-export const APP_KEY_CLIENTS = Object.freeze([]);
+// Create a key with tools/create_app_key.py. Revoke by deleting the row and redeploying.
+export const APP_KEY_CLIENTS = Object.freeze([
+  // poke-guide built and served on the owner's computer (huddle poke-guide-dev-key,
+  // PLAN.md decision 30). The local site cannot use the Turnstile session: that widget
+  // and the poke-guide client accept only the production origins.
+  Object.freeze({
+    id: 'poke-guide-dev',
+    auth: 'app-key',
+    keySha256: '890292535eece278664384dbb8fb254d94ea4e9ec9b40feb6f7f223ae3889cf1',
+    routes: POKE_GUIDE_ROUTES,
+    fillPolicy: 'none',
+    quota: Object.freeze({ daily: 20000, perMinute: 600, perMinuteBinding: 'RATE_LIMIT_APP' }),
+    maxQuoteItems: 100,
+    origins: Object.freeze(['http://localhost:5500', 'http://127.0.0.1:5500']),
+  }),
+]);
 
 // Public browser clients (PLAN.md section 6.3): a Turnstile-proven, short-lived session
 // token, read-only routes, fill policy forced to none, per-IP limits.
@@ -69,23 +104,7 @@ export const PUBLIC_SESSION_CLIENTS = Object.freeze([
   Object.freeze({
     id: 'poke-guide',
     auth: 'public-session',
-    routes: Object.freeze([
-      'pricing:quote',
-      'pricing:product',
-      'pricing:history',
-      'pricing:history.printings',
-      'pricing:history.coverage',
-      'pricing:games',
-      'pricing:snapshot.manifest',
-      'pricing:snapshot.file',
-      'catalog:manifest',
-      'catalog:artifact',
-      'catalog:view',
-      'catalog:sets',
-      'catalog:image',
-      'catalog:products.get',
-      'catalog:games',
-    ]),
+    routes: POKE_GUIDE_ROUTES,
     fillPolicy: 'none',
     quota: Object.freeze({ daily: null, perMinute: 300, perMinuteBinding: 'RATE_LIMIT_SESSION' }),
     maxQuoteItems: 100,
