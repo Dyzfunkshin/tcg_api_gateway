@@ -77,7 +77,7 @@ the SHA-256 for the row; see [docs/PLAN.md](docs/PLAN.md) section 6.4.
 
 | Client | For | May call | Limits |
 |---|---|---|---|
-| `poke-guide-dev` | poke-guide built and served on the owner's computer (`http://localhost:5500`, `http://127.0.0.1:5500`) | exactly the public-site routes listed under "Public websites" below; fill policy `none` | 600 requests/min, 20,000/day, 100 items per quote |
+| `poke-guide-dev` | poke-guide built and served on the owner's computer (`http://localhost:5500`, `http://127.0.0.1:5500`) | exactly the public-site routes listed under "poke-guide client contract" below; fill policy `none` | 600 requests/min, 20,000/day, 100 items per quote |
 
 The development key is read from Bitwarden (`TCG_GATEWAY_APP_KEY_POKE_GUIDE_DEV`) for
 local builds only. It must never be committed, passed to CI, or included in a published
