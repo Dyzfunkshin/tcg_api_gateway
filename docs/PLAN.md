@@ -585,7 +585,10 @@ sections above):
 29. **Deploy from GitHub on a version tag** (owner, 2026-11-11). Pushing a `v*` tag whose
     commit is on `main` runs `.github/workflows/deploy.yml`: offline tests, a check that
     `wrangler.toml` still lists both custom domains, `wrangler@4 deploy`, then a health
-    check on both hostnames. The Cloudflare token is read from Bitwarden at run time by
+    check on both hostnames. A deploy-only Cloudflare token, `TCG_GATEWAY_CI_CLOUDFLARE_API_TOKEN`
+    (Workers Scripts, Workers KV Storage, Account Settings read, Workers Routes on the two
+    zones; no IP filter, because runner addresses vary; the operator token stays
+    IP-restricted and is not used by CI), is read from Bitwarden at run time by
     the machine account `gateway-ci` (**Can read** on `api-gateway` only); GitHub holds
     only that account's access token, as the repository secret `BW_ACCESS_TOKEN`.
     `main` exists from this date and is GitHub's default branch. Deploying from the
